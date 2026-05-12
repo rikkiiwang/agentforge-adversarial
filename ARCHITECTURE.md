@@ -104,9 +104,9 @@ through the Co-Pilot.
 
 | Agent | Responsibility | Trust level | Default model |
 |---|---|---|---|
-| Orchestrator | Campaign selection · swarm configuration · post-verdict signal routing | Medium — decides spend, budget-capped | Haiku 4.5 (or pure Python config table for MVP) |
-| Red Team Swarm | Novel attack generation · multi-turn sequences · mutation / variants | Lowest — outputs never auto-applied | User-configurable; default mix of local OSS (Llama 3.x / Mistral) + ablated models via Ollama |
-| Judge | Verdict (PASS/PARTIAL/FAIL) · category-claim validation | Medium — verdicts authoritative but auditable | Haiku 4.5 |
+| Orchestrator | Campaign selection (pure-Python, 5 weighted signals + 2 hard constraints) · per-category cost-pool budget allocation · `SwarmRecommendation` for the operator (operator owns `config/swarm.yaml`; agent suggests, never auto-rewrites) · post-verdict signal routing. Detail: `docs/agents/orchestrator.md`. | Medium — decides spend, budget-capped, no LLM call in the decision path | Pure Python — no LLM model |
+| Red Team Swarm | **Homogeneous** subagents in parallel fan-out (same role; different LLMs for diversity). Novel attack gen + mutation variants via dual prompt templates (`novelty` / `mutator`). Structured output enforced by Pydantic + single retry on schema fail. Operator-owned `config/swarm.yaml`; Orchestrator recommends, never auto-rewrites. Detail: `docs/agents/red-team-swarm.md`. | Lowest — outputs never auto-applied | Local OSS via Ollama sidecar (Llama-3-uncensored / DeepSeek-R1 / Mistral defaults); Claude Sonnet 4.6 for vision-required categories |
+| Judge | Verdict (PASS/PARTIAL/FAIL) via per-category hybrid rubric (YAML declarative + Python predicates + verdict_map). Cross-judge ensemble (Haiku + Sonnet) auto-triggers for ⭐ categories and HIGH/CRITICAL severity. Validates declared category. Detail: `docs/agents/judge.md`. | Medium — verdicts authoritative but auditable | Haiku 4.5 (single); Sonnet 4.6 (ensemble) |
 | Documentation | Reads FAIL signal · assigns severity (per-category baseline + LLM modifier) · writes `vulnerabilities` + `vuln_reports` rows in `discovered` state · updates report when Class-probe completes · suggests defense-mapped remediation. Detail: `docs/agents/documentation-agent.md`. | Medium — high-severity human-gated | Sonnet 4.6 |
 
 The Judge and Red Team Swarm **must use different model families**.
@@ -191,13 +191,26 @@ A rendered version of this diagram will live under `docs/diagrams/`.
 
 1. **Trigger.** New target version deployed (`/healthz` SHA change), or
    scheduled tick (weekly), or human kick-off via dashboard.
-2. **Orchestrator dispatch.** Reads coverage heat-map. Identifies the
-   highest-leverage cell (untested → wavering → exploited-but-unrepaired).
-   Sets cost budget. Picks Red Team swarm configuration (N subagents,
-   per-subagent model from config table). Emits campaign brief.
-3. **Red Team fan-out.** LangGraph spawns *N* subagent nodes in parallel.
-   Each generates M candidate attacks under the brief, emitting structured
-   output. The swarm produces N×M candidates.
+2. **Orchestrator dispatch** (pure Python, no LLM). Hard constraints
+   first: any overdue `regression_schedule` row forces an immediate
+   replay; a detected `target_version` change triggers a full sweep.
+   Otherwise: compute the 5-signal weighted score
+   (coverage_gap · partial_rate · severity_baseline · staleness ·
+   diversity_score) per cell from `threat_model_cells` × current
+   coverage state; pick the top cell. Size the budget from the
+   per-category daily pool. Compute a `SwarmRecommendation` from
+   `config/swarm.yaml` (operator-owned) + per-category overrides;
+   emit `CampaignBrief` carrying cell, budget, swarm recommendation,
+   seed strategy, and the full scoring breakdown for auditability.
+3. **Red Team fan-out.** LangGraph spawns *N* homogeneous subagent nodes
+   in parallel via `asyncio.gather` — same role, different LLMs (diversity
+   from model variance). Each loads a `novelty` or `mutator` prompt
+   template depending on `CampaignBrief.seed_strategy`, generates M
+   candidates, and emits a Pydantic-validated `SubagentOutput` (single
+   retry on schema fail; degraded swarm proceeds with surviving subagents).
+   Local OSS models hit an Ollama sidecar; frontier-provider subagents
+   hit Anthropic / OpenAI APIs directly. The swarm produces up to N×M
+   candidates.
 4. **Synthesis (plain Python).** `synthesize_fn()` runs six stages:
    normalize → embed → within-batch dedup → novelty filter against
    `attack_runs` history → weighted score → budget-capped greedy pick with
@@ -349,16 +362,25 @@ Detail in `docs/components/dashboard.md` (approval gates UX) and
 
 ## 10. Cost model
 
-Three layers of caps to prevent the platform from running away in cost:
+Four layers, processed top-down (detail in `docs/agents/orchestrator.md` §6):
 
-- **Per-campaign budget** — set by Orchestrator at dispatch time; sum of
-  estimated swarm cost + estimated target dispatch cost. Synthesis cap
-  enforces this floor.
-- **Per-agent token cap** — defensive; prevents a single LLM call from
-  consuming the whole budget.
-- **Per-category cost ceiling** — Orchestrator deprioritizes a category
-  when burn-rate > finding-rate over the trailing window. Hardened
-  categories cost-out naturally.
+- **Per-category daily pool** — operator-configured in
+  `config/orchestrator.yaml` (default `$5/day`, `$10/day` for ⭐
+  categories). Once exhausted, that category is deprioritized for the
+  rest of the day.
+- **Per-campaign budget** — `max($0.50, normalized_score × remaining_pool)`
+  at dispatch time. Cheap campaigns get the floor; high-score campaigns
+  get a proportional slice.
+- **Per-attack run cap** — enforced by the Judge (`$0.02` single,
+  `$0.05` ensemble; `docs/agents/judge.md` §10).
+- **Synthesis floor** — `synthesize_fn` caps K final attacks to fit
+  the campaign budget; floors prevent monoculture (≥1 per subagent,
+  ≥1 per declared channel).
+
+Adaptive adjustments computed nightly by the Orchestrator: categories
+that produced zero findings for two consecutive days have their pool
+halved; categories that produced a CRITICAL finding get pool doubled
+for 7 days. Operator can override at any time via `config/orchestrator.yaml`.
 
 The dashboard's cost tile reports `$/run`, `cost-per-finding`, and
 per-agent burn rate. Detail in `docs/components/dashboard.md`.
@@ -370,7 +392,7 @@ per-agent burn rate. Detail in `docs/components/dashboard.md`.
 | Decision | What it buys | What it gives up | Mitigation |
 |---|---|---|---|
 | Plain-Python synthesis (no LLM) | Cheap, deterministic, replayable, inspectable | Loses semantic dedup across language / encoding boundaries | Optional LLM tiebreaker on top-K only; channel tag is the join key for encoded-vs-plaintext |
-| Lightweight Judge LLM | Fast, cheap (Haiku) | May miss subtle FAILs that need deeper reasoning | Cross-judge ensemble (Sonnet + Haiku) for high-severity; periodic ground-truth recalibration |
+| Lightweight Judge LLM | Fast, cheap (Haiku) | May miss subtle FAILs that need deeper reasoning | Cross-judge ensemble (Sonnet + Haiku) auto-triggers for ⭐ categories + HIGH/CRITICAL severity; disagreement on PASS↔FAIL escalates to human triage. Calibration via `make judge-calibrate` ground-truth fixtures; weekly drift sample. Detail in `docs/agents/judge.md` §7, §9. |
 | Single Postgres (not message queue) | Simple ops; ACID for vuln state | Scaling beyond ~10 campaigns/min becomes write-contention bound | Read replicas; partitioning by target_version; sketched in `docs/components/database-schema.md` |
 | Red Team uses local / OSS models | Bypasses frontier refusal of offensive workflows; lower marginal cost | Lower attack quality per turn vs Claude / GPT-4o | Configurable: operator can swap in a frontier model with a red-team-tuned system prompt; documented in `docs/agents/red-team-swarm.md` |
 | LangGraph (not CrewAI / AutoGen / custom) | Matches W2 supervisor pattern; team familiarity; deterministic state machine | Less optimized for huge agent populations | Acceptable for 4-agent topology + 10–50 subagent swarms |
