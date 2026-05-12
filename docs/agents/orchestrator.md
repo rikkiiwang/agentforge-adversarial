@@ -74,7 +74,7 @@ It's also written verbatim to a `campaigns` table for auditability (so
 |---|---|
 | `pass` | INSERT no new row (verdict already in `attack_runs`); update per-cell coverage counters; trigger next campaign dispatch if budget remains |
 | `partial` | INSERT `near_misses` row (state=`exploring`); enqueue mutator round for the next dispatch |
-| `fail` | Three parallel branches: dispatch Documentation Agent node · INSERT `regression_schedule` row · dispatch Class-probe mutator. (See `ARCHITECTURE.md` §4 step 7c.) |
+| `fail` | Three parallel branches: dispatch Documentation Agent node · INSERT `regression_schedule` row · Class-probe mutator **enqueues ~10 variants into `attack_queue` with `source='mutator'`** (variants go through the normal dispatcher, never written directly to `attack_runs`). See `ARCHITECTURE.md` §4 step 7c. |
 
 The Orchestrator does **not** write to `vulnerabilities`,
 `vuln_reports`, or `regression_schedule.last_verdict` directly. Those
@@ -213,8 +213,9 @@ for the rest of the day.
 
 The Judge enforces `$0.02` single-judge / `$0.05` ensemble per attack
 (documented in `docs/agents/judge.md` §10). Class-probe and mutator
-spawn additional `attack_runs` rows that consume the campaign budget
-until exhausted.
+enqueue additional attacks (via `attack_queue` with `source='mutator'`);
+each is dispatched + judged like any other attack and consumes the
+campaign budget until exhausted.
 
 A category that produces zero findings for two consecutive days has
 its daily pool halved (configurable). A category that produces a

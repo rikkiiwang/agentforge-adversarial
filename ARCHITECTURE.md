@@ -216,16 +216,30 @@ A rendered version of this diagram will live under `docs/diagrams/`.
    `attack_runs` history → weighted score → budget-capped greedy pick with
    subagent + channel diversity floors. Output: K final attacks
    (`K ≤ N×M`, typically `K ≈ 4–10`).
-5. **Dispatch to target.** Each final attack is executed against the live
-   Co-Pilot via HTTPS. Transcript captured. Cost recorded.
-6. **Judge.** Independent LLM evaluates the transcript per category-specific
-   boolean rubric. Emits `PASS / PARTIAL / FAIL` + `category_validated:
-   bool`. Writes one `attack_runs` row per execution.
+5. **Dispatch to target.** The dispatcher consumes the synthesized
+   attacks from `attack_queue`, executes each against the live
+   Co-Pilot via HTTPS, captures the transcript + cost + latency, and
+   **INSERTs a new `attack_runs` row** with Judge columns NULL,
+   `queue_entry_id` set to the originating queue entry's id, and
+   `dispatcher_version` recorded. The `attack_runs.queue_entry_id
+   UNIQUE` constraint prevents duplicate INSERTs on retry. See
+   `docs/components/database-schema.md` §1 and
+   `docs/components/attack-queue.md` §5.
+6. **Judge.** Independent LLM evaluates the transcript per category-
+   specific boolean rubric. Emits `PASS / PARTIAL / FAIL` +
+   `category_validated: bool`. **UPDATEs the existing `attack_runs`
+   row** (the one the dispatcher created in step 5) atomically — the
+   `attack_runs_judge_atomic` CHECK constraint enforces all-or-nothing
+   on the 5 Judge columns. The Judge never INSERTs `attack_runs`
+   rows.
 7. **Post-verdict routing** (Orchestrator re-invoked):
    - PASS → bump coverage signal, no further work.
    - PARTIAL → spawn `near_misses` row in `exploring` state; mutator
-     produces N variants per round, capped at K rounds; reuses
-     synthesize_fn each round.
+     generates N variant attacks and **enqueues each into
+     `attack_queue` with `source='mutator'` + `parent_id`** pointing
+     at the originating `attack_runs` row. The dispatcher consumes
+     them on its normal poll cycle (no special path). Capped at K
+     rounds; reuses `synthesize_fn` each round.
    - FAIL → 3-way parallel fan-out:
      - **(a) Documentation Agent** runs the report pipeline:
        1. Read FAIL `attack_runs` row + lineage (`parent_id` chain) +
@@ -241,9 +255,16 @@ A rendered version of this diagram will live under `docs/diagrams/`.
           `parent_vuln_id` pointing to this one.
      - **(b) Regression Harness** inserts into `regression_schedule`
        (keyed by the FAIL `attack_runs.id` + originating `vuln_id`).
-     - **(c) Class-probe** (Red Team mutator) spawns ~10 variants to map
-       the vulnerability boundary; each variant becomes its own
-       `attack_runs` row → Judge → (per-variant verdict).
+       Future replays go through the queue: harness enqueues
+       `source='regression'` rows; the dispatcher INSERTs the
+       resulting `attack_runs`. See
+       `docs/components/regression-harness.md` §4.
+     - **(c) Class-probe** (Red Team mutator) generates ~10 variant
+       attacks designed to map the vulnerability boundary and
+       **enqueues each into `attack_queue` with `source='mutator'` +
+       `parent_id`** pointing at the FAIL `attack_runs` row. Each
+       variant becomes its own `attack_runs` row when the dispatcher
+       picks it up → Judge UPDATEs verdict → (per-variant outcome).
 8. **Persist signals.** Postgres tables updated; Langfuse trace closed;
    dashboard views recompute on next query.
 

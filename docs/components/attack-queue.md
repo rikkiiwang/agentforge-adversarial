@@ -112,6 +112,17 @@ async def dispatch_one(entry):
         await emit_alert('target_unreachable', campaign_id=entry.campaign_id)
 ```
 
+**`write_attack_run` is the canonical INSERT of an `attack_runs` row.**
+The dispatcher writes the transcript, cost, latency, embedding,
+`queue_entry_id` (pointing at `entry.id`), `dispatcher_version`, and
+— if the queue entry's `source = 'regression'` — `harness_version`
+copied from the queue entry's metadata. **Judge columns stay `NULL`**
+until the Judge LangGraph node UPDATEs them in a separate flow
+(`docs/agents/judge.md` §3). The `attack_runs.queue_entry_id UNIQUE`
+constraint (`docs/components/database-schema.md` §1) prevents
+duplicate inserts on a dispatcher retry — the second INSERT fails
+at the database level.
+
 After the attack_runs row is written, the Judge LangGraph node
 picks up the row (separate flow). The queue entry's purpose ends at
 `state='dispatched'`.
@@ -169,7 +180,7 @@ never re-enter the dispatch loop.
 | Queue depth alert threshold | 1000 entries queued for >1 hour → dashboard alert |
 | Archival age | 90 days → `attack_queue_archive` |
 | Failure handling | Failed dispatches are NOT auto-retried; operator can re-queue via dashboard |
-| Idempotency | `attack_run_id` foreign key prevents duplicate `attack_runs` from the same queue entry |
+| Idempotency | `attack_runs.queue_entry_id` carries a `UNIQUE` constraint plus a DEFERRABLE FK back to `attack_queue.id`. A dispatcher retry attempting to INSERT a second `attack_runs` row for the same queue entry fails at the database level. Source of truth: `docs/components/database-schema.md` §1. |
 
 ---
 
@@ -181,8 +192,12 @@ never re-enter the dispatch loop.
 QUEUE_VERSION = "0.4.0"
 ```
 
-Bumped on schema or dispatch-policy changes. Recorded in
-`attack_queue.dispatcher_version` per entry (TODO column).
+Bumped on schema or dispatch-policy changes. The dispatcher records
+its `QUEUE_VERSION` in `attack_runs.dispatcher_version` on every
+INSERT — the canonical column lives on `attack_runs` (defined in
+`docs/components/database-schema.md` §1), not on `attack_queue`, so
+that a dispatcher upgrade mid-queue is correctly attributed to the
+dispatch event (not the enqueue event).
 
 ---
 

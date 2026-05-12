@@ -21,14 +21,39 @@ Referenced from `ARCHITECTURE.md` §6, `docs/agents/documentation-agent.md`
   `0003_add_pgvector_index_attack_runs.py`).
 - All tables get `created_at` / `updated_at`; `updated_at` is maintained
   by a `BEFORE UPDATE` trigger (`set_updated_at`).
+- **Migration order:** the section numbers below are reader-friendly,
+  not strictly migration-order. Several FKs cross-reference tables
+  defined later in the file (e.g., `vulnerabilities.threat_model_cell_id`
+  → `threat_model_cells` in §6; `attack_queue.campaign_id` → `campaigns`
+  in §7; `attack_runs.queue_entry_id` → `attack_queue` in §8). For
+  every such forward reference, the Alembic migration must either
+  declare the FK as `DEFERRABLE INITIALLY DEFERRED`, or add it via a
+  later migration's `ALTER TABLE … ADD CONSTRAINT`. The dependency
+  order for the first migration is: `threat_model_cells` → `campaigns`
+  → `attack_runs` → `vulnerabilities` → `vuln_reports` → `near_misses`
+  → `regression_schedule` → `attack_queue` → `cross_regressions`. The
+  `attack_runs ⇄ attack_queue` cycle is broken by adding
+  `attack_runs.queue_entry_id`'s FK via ALTER TABLE after both tables
+  exist (the UNIQUE constraint declares inline; the FK references
+  is deferred).
 
 ---
 
 ## 1. `attack_runs`
 
-The canonical record of every attack execution. Written by the Judge
-node when it emits a verdict. Heat-map, near-miss tile, and vuln board
-queries all root here.
+The canonical record of every attack execution. Written in **two
+phases**:
+
+1. The **dispatcher** INSERTs the row when it executes an attack
+   against the target — carrying transcript, cost, latency,
+   embedding, and `queue_entry_id`. Judge columns are NULL at this
+   point.
+2. The **Judge** UPDATEs the Judge columns atomically when it
+   produces a verdict (the `attack_runs_judge_atomic` CHECK
+   constraint declared below enforces all-or-nothing on the Judge
+   columns).
+
+Heat-map, near-miss tile, and vuln board queries all root here.
 
 ```sql
 CREATE TYPE attack_source AS ENUM ('direct', 'random', 'mutator', 'regression');
@@ -48,6 +73,18 @@ CREATE TABLE attack_runs (
   red_team_model       text        NOT NULL,                   -- e.g., "llama-3-70b-uncensored"
   attack_prompt        text        NOT NULL,                   -- the actual attack text
   transcript_uri       text,                                   -- pointer to full transcript in object store
+
+  -- Queue → runs idempotency. Set by the dispatcher at INSERT time.
+  -- UNIQUE prevents a dispatcher retry from creating a duplicate row;
+  -- the FK to attack_queue(id) is added via ALTER TABLE in a later
+  -- migration to break the attack_runs ⇄ attack_queue declaration cycle.
+  -- Nullable to allow forward-compatible backfill, but every dispatcher
+  -- INSERT carries it.
+  queue_entry_id       uuid        UNIQUE,
+
+  -- Audit columns recorded by the dispatcher at INSERT time
+  dispatcher_version   text        NOT NULL,                   -- which queue dispatcher version produced this
+  harness_version      text,                                   -- NULL except when source='regression'
 
   -- Judge-written columns. NULL between dispatch and judgment completion
   -- (or permanently NULL if the Judge crashed before writing). Dashboard
@@ -80,8 +117,28 @@ CREATE TABLE attack_runs (
        AND judge_rubric_version IS NOT NULL
        AND category_validated IS NOT NULL
        AND judged_at IS NOT NULL)
+  ),
+
+  -- harness_version is set if and only if source='regression'. Prevents
+  -- non-regression rows from carrying a stale harness_version and
+  -- ensures every regression replay records the harness that ran it.
+  CONSTRAINT attack_runs_harness_version_source_match CHECK (
+    (source = 'regression' AND harness_version IS NOT NULL)
+    OR
+    (source <> 'regression' AND harness_version IS NULL)
   )
 );
+
+-- attack_runs.queue_entry_id FK is added via ALTER TABLE in the
+-- migration that creates attack_queue (see §8), breaking the
+-- attack_runs ⇄ attack_queue declaration cycle:
+--   ALTER TABLE attack_runs ADD CONSTRAINT attack_runs_queue_entry_fk
+--     FOREIGN KEY (queue_entry_id) REFERENCES attack_queue(id)
+--     DEFERRABLE INITIALLY DEFERRED;
+-- The UNIQUE constraint on queue_entry_id (declared inline above) is
+-- the source-of-truth idempotency guarantee that prevents the
+-- dispatcher from inserting a second attack_runs row for the same
+-- queue entry.
 
 CREATE INDEX attack_runs_target_version_idx ON attack_runs (target_version);
 CREATE INDEX attack_runs_category_idx ON attack_runs (category, subcategory, channel);
@@ -308,52 +365,15 @@ The `defenses_referenced` JSON shape mirrors what's declared in
 
 ---
 
-## 7. `attack_queue`
-
-Postgres-backed FIFO of attacks ready to dispatch. Distinct from
-`attack_runs` — `attack_queue` is the *pre-dispatch* buffer; once an
-attack is dispatched + judged, its row in `attack_queue` reaches
-terminal state and the persistent record lives in `attack_runs`.
-
-Detail: `docs/components/attack-queue.md`.
-
-```sql
-CREATE TYPE queue_state AS ENUM (
-  'queued', 'dispatching', 'dispatched', 'failed', 'cancelled'
-);
-
-CREATE TABLE attack_queue (
-  id              uuid           PRIMARY KEY DEFAULT uuid_generate_v4(),
-  campaign_id     uuid           NOT NULL REFERENCES campaigns(id),
-  source          attack_source  NOT NULL,
-  category        text           NOT NULL,
-  subcategory     text           NOT NULL,
-  channel         text           NOT NULL,
-  attack_prompt   text           NOT NULL,
-  multi_turn_seq  jsonb,                          -- null for single-turn
-  parent_id       uuid           REFERENCES attack_runs(id),
-  priority_score  real           NOT NULL,
-  state           queue_state    NOT NULL DEFAULT 'queued',
-  enqueued_at     timestamptz    NOT NULL DEFAULT now(),
-  dispatched_at   timestamptz,
-  attack_run_id   uuid           REFERENCES attack_runs(id),    -- populated after dispatch
-  failure_reason  text                                          -- populated if state='failed'
-);
-
--- Partial index keeps dispatch poll cheap even at 100K+ historical entries
-CREATE INDEX attack_queue_dispatch_ready_idx
-  ON attack_queue (state, priority_score DESC, enqueued_at)
-  WHERE state = 'queued';
-```
-
----
-
-## 8. `campaigns`
+## 7. `campaigns`
 
 Audit trail of every Orchestrator dispatch. One row per
 `CampaignBrief`. Lets any future operator answer "why did the
 platform run this campaign on 2026-05-15?" by replaying the same
 state inputs through the same Orchestrator version.
+
+Declared **before** `attack_queue` (§8) so the
+`attack_queue.campaign_id` FK has a target at migration time.
 
 Written by the Orchestrator's dispatch node (verbatim from
 `CampaignBrief`). Read by the dashboard, the Regression Harness
@@ -393,6 +413,56 @@ CREATE INDEX campaigns_target_version_idx ON campaigns (target_version);
 CREATE INDEX campaigns_category_idx       ON campaigns (category, subcategory);
 CREATE INDEX campaigns_inflight_idx       ON campaigns (dispatched_at)
   WHERE completed_at IS NULL;
+```
+
+---
+
+## 8. `attack_queue`
+
+Postgres-backed FIFO of attacks ready to dispatch. Distinct from
+`attack_runs` — `attack_queue` is the *pre-dispatch* buffer; once an
+attack is dispatched + judged, its row in `attack_queue` reaches
+terminal state and the persistent record lives in `attack_runs`.
+
+Detail: `docs/components/attack-queue.md`.
+
+```sql
+CREATE TYPE queue_state AS ENUM (
+  'queued', 'dispatching', 'dispatched', 'failed', 'cancelled'
+);
+
+CREATE TABLE attack_queue (
+  id              uuid           PRIMARY KEY DEFAULT uuid_generate_v4(),
+  campaign_id     uuid           NOT NULL REFERENCES campaigns(id),
+  source          attack_source  NOT NULL,
+  category        text           NOT NULL,
+  subcategory     text           NOT NULL,
+  channel         text           NOT NULL,
+  attack_prompt   text           NOT NULL,
+  multi_turn_seq  jsonb,                          -- null for single-turn
+  parent_id       uuid           REFERENCES attack_runs(id),
+  priority_score  real           NOT NULL,
+  state           queue_state    NOT NULL DEFAULT 'queued',
+  enqueued_at     timestamptz    NOT NULL DEFAULT now(),
+  dispatched_at   timestamptz,
+  attack_run_id   uuid           REFERENCES attack_runs(id),    -- populated after dispatch; uniqueness lives on attack_runs.queue_entry_id
+  failure_reason  text                                          -- populated if state='failed'
+);
+
+-- Partial index keeps dispatch poll cheap even at 100K+ historical entries
+CREATE INDEX attack_queue_dispatch_ready_idx
+  ON attack_queue (state, priority_score DESC, enqueued_at)
+  WHERE state = 'queued';
+
+-- Cycle-breaker: now that both attack_queue and attack_runs exist,
+-- add the FK from attack_runs.queue_entry_id to attack_queue.id.
+-- DEFERRABLE INITIALLY DEFERRED allows the dispatcher to write both
+-- rows in a single transaction without ordering constraints.
+ALTER TABLE attack_runs
+  ADD CONSTRAINT attack_runs_queue_entry_fk
+  FOREIGN KEY (queue_entry_id)
+  REFERENCES attack_queue(id)
+  DEFERRABLE INITIALLY DEFERRED;
 ```
 
 ---
@@ -486,6 +556,20 @@ index to avoid blocking reads during refresh.
   the same `SwarmRecommendation` Pydantic model used at dispatch
   (i.e., the operator's modifications must still be valid swarm
   specs). Validated in application layer, not DB.
+- `attack_runs.queue_entry_id` is `UNIQUE` (declared inline in §1) and
+  references `attack_queue(id)` via a DEFERRABLE INITIALLY DEFERRED FK
+  (added via `ALTER TABLE` in §8 to break the declaration cycle).
+  This is the **single source of truth for queue→runs idempotency** —
+  a dispatcher retry on the same queue entry fails at the database
+  level on the duplicate INSERT.
+- `attack_runs.harness_version` is set if and only if
+  `source = 'regression'`. Enforced by the inline
+  `attack_runs_harness_version_source_match` CHECK constraint in §1.
+- `attack_runs.dispatcher_version` is `NOT NULL` (recorded at INSERT
+  time by every dispatcher; no CHECK needed).
+- `attack_queue.attack_run_id` is a denormalization for lookup
+  convenience. The authoritative uniqueness lives on
+  `attack_runs.queue_entry_id`, not here.
 
 Detail of trigger SQL goes into the first Alembic migration.
 

@@ -42,7 +42,7 @@ fix actually hold?"* question.
 
 ## 3. Outputs
 
-Two write surfaces, both narrowly scoped:
+Three write surfaces, all narrowly scoped:
 
 - **`regression_schedule`** — UPDATE `last_run_at`, `last_verdict`,
   `last_target_version`, append to `target_versions_passed` on every
@@ -51,10 +51,15 @@ Two write surfaces, both narrowly scoped:
 - **`vulnerabilities.state`** — transition writes for `fix_validated`
   and `reopened` only (per ARCHITECTURE.md §13). No other state
   writes from this component.
+- **`attack_queue`** — INSERT new rows with `source='regression'`
+  to schedule replays (per §4). The harness enqueues replays; it
+  **never writes `attack_runs` directly** — the dispatcher
+  (`docs/components/attack-queue.md` §5) owns that INSERT.
 
 The harness does **not** write `vuln_reports` (Documentation Agent
-owns that) and does **not** write `attack_runs` directly (replays go
-through Judge, which writes).
+owns that) and does **not** write `attack_runs` directly. It reads
+`attack_runs` (after the dispatcher INSERTs and the Judge UPDATEs
+the verdict) to decide on state transitions.
 
 **Replay behavior for closed vulns:** the harness DOES continue
 replaying `regression_schedule` rows whose vuln is in
@@ -84,21 +89,33 @@ set `regression_schedule.enabled = false` from the dashboard (see §8).
    └─────────────────┬───────────────┘
                      │ batch of due rows
                      ▼
-   ┌─────────────────────────────────┐
-   │  For each row, in parallel       │
-   │  (capped by max_parallel):       │
-   │                                  │
-   │   1. Load original attack_runs   │
-   │      row by attack_run_id        │
-   │   2. Dispatch attack against     │
-   │      live target (current SHA)   │
-   │   3. Insert new attack_runs row  │
-   │      with source='regression'    │
-   │      + parent_id=<original>      │
-   │   4. Judge writes verdict        │
-   │   5. UPDATE regression_schedule  │
-   │      with new verdict + version  │
-   └─────────────────┬───────────────┘
+   ┌──────────────────────────────────┐
+   │  For each row, in parallel        │
+   │  (capped by max_parallel):        │
+   │                                   │
+   │   1. Load original attack_runs    │
+   │      row by attack_run_id         │
+   │   2. ENQUEUE attack_queue row:    │
+   │        source='regression'        │
+   │        parent_id=<original>       │
+   │        + prompt + cat + channel   │
+   │        + harness_version metadata │
+   │      (harness never writes        │
+   │       attack_runs directly)       │
+   │   3. Dispatcher consumes the      │
+   │      queue entry → executes       │
+   │      against live target →        │
+   │      INSERTs attack_runs row      │
+   │   4. Judge UPDATEs verdict on     │
+   │      the dispatcher's row         │
+   │   5. Harness watches for newly    │
+   │      judged source='regression'   │
+   │      rows whose parent_id ties    │
+   │      back to a schedule entry,    │
+   │      then UPDATEs                 │
+   │      regression_schedule with     │
+   │      new verdict + version        │
+   └─────────────────┬────────────────┘
                      │
                      ▼
    ┌─────────────────────────────────┐
@@ -121,9 +138,10 @@ set `regression_schedule.enabled = false` from the dashboard (see §8).
 ```
 
 Each replay produces a *new* `attack_runs` row (never overwrites the
-original). The lineage is preserved via `parent_id`. So a vuln's
-"history" is reconstructible by walking `attack_runs` for all rows
-where `parent_id` chains back to the originating attack_run.
+original) — created by the dispatcher, not the harness. The lineage
+is preserved via `parent_id`. So a vuln's "history" is reconstructible
+by walking `attack_runs` for all rows where `parent_id` chains back
+to the originating attack_run.
 
 ---
 
@@ -267,9 +285,9 @@ The harness has authority to write exactly two states:
   re-FAILs
 
 No other writes. The harness never writes `vuln_reports`, never
-modifies `attack_runs` outside the canonical "Judge writes verdict"
-path, and never auto-disables `regression_schedule` rows (operator
-authority only).
+INSERTs or UPDATEs `attack_runs` directly (the dispatcher INSERTs;
+the Judge UPDATEs Judge columns), and never auto-disables
+`regression_schedule` rows (operator authority only).
 
 When a vuln transitions to `reopened`, the harness emits an alert
 visible in the Vuln Board (high-priority badge) and triggers the
@@ -289,8 +307,14 @@ HARNESS_VERSION = "0.4.0"
 ```
 
 Bumped on changes to the replay flow, sweep logic, or state-
-transition rules. Recorded in every `attack_runs.source='regression'`
-row via a new `harness_version` column (schema migration TODO).
+transition rules. The harness attaches `HARNESS_VERSION` to each
+enqueued `attack_queue` row's metadata; the dispatcher copies that
+metadata into `attack_runs.harness_version` at INSERT time. The
+schema's `attack_runs_harness_version_source_match` CHECK constraint
+(`docs/components/database-schema.md` §1) enforces that
+`harness_version` is set if and only if `source='regression'`, so
+the dispatcher cannot accidentally drop the value or leak it onto
+non-regression rows.
 
 ---
 

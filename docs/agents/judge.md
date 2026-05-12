@@ -46,8 +46,14 @@ attack).
 
 ## 3. Outputs
 
-Writes exactly **one** row per attack run, to `attack_runs`. Fields it
-sets:
+**UPDATEs** the existing `attack_runs` row that the dispatcher created.
+The dispatcher INSERTs the row at execution time with Judge columns
+NULL; the Judge fills them in atomically per the
+`attack_runs_judge_atomic` CHECK constraint in
+`docs/components/database-schema.md` §1. The Judge never INSERTs an
+`attack_runs` row — only UPDATEs.
+
+Fields the Judge sets:
 
 - `judge_verdict` enum — `pass` | `partial` | `fail`
 - `judge_reasoning` text — JSON with `triggered_rule`, `predicates`, `ensemble_models` (if applicable), and free-text rationale
