@@ -53,10 +53,15 @@ Two write surfaces, both narrowly scoped:
   writes from this component.
 
 The harness does **not** write `vuln_reports` (Documentation Agent
-owns that), does **not** write `attack_runs` directly (replays go
-through Judge, which writes), and does **not** modify schedule rows
-for vulns in `closed` state — those are explicitly out of the rotation
-until manually reopened.
+owns that) and does **not** write `attack_runs` directly (replays go
+through Judge, which writes).
+
+**Replay behavior for closed vulns:** the harness DOES continue
+replaying `regression_schedule` rows whose vuln is in
+`state='closed'` — a closed fix is still a fix that needs validation,
+and a re-FAIL on a closed vuln is precisely what should trigger a
+`reopened` transition. The only way to stop replays is to explicitly
+set `regression_schedule.enabled = false` from the dashboard (see §8).
 
 ---
 

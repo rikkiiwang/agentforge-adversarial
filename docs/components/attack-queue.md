@@ -43,36 +43,29 @@ Each entry carries the source tag (`direct`, `random`, `mutator`,
 A dedicated `attack_queue` table (separate from `attack_runs` —
 `attack_runs` is the persistent record after dispatch+judge).
 
-```sql
-CREATE TYPE queue_state AS ENUM (
-  'queued', 'dispatching', 'dispatched', 'failed', 'cancelled'
-);
+**Canonical DDL lives in `docs/components/database-schema.md` §7.**
+This file only summarizes the fields conceptually so future readers
+don't need to chase the schema doc to understand what each entry
+carries.
 
-CREATE TABLE attack_queue (
-  id                  uuid           PRIMARY KEY DEFAULT uuid_generate_v4(),
-  campaign_id         uuid           NOT NULL,
-  source              attack_source  NOT NULL,        -- enum from attack_runs schema
-  category            text           NOT NULL,
-  subcategory         text           NOT NULL,
-  channel             text           NOT NULL,
-  attack_prompt       text           NOT NULL,
-  multi_turn_seq      jsonb,                          -- null for single-turn
-  parent_id           uuid,                           -- chains to source attack_run
-  priority_score      real           NOT NULL,        -- from synthesis or harness
-  state               queue_state    NOT NULL DEFAULT 'queued',
-  enqueued_at         timestamptz    NOT NULL DEFAULT now(),
-  dispatched_at       timestamptz,
-  attack_run_id       uuid,                           -- populated after dispatch
-  failure_reason      text                            -- populated if state='failed'
-);
+Per-entry fields:
 
-CREATE INDEX attack_queue_dispatch_ready_idx
-  ON attack_queue (state, priority_score DESC, enqueued_at)
-  WHERE state = 'queued';
-```
+| Field | Notes |
+|---|---|
+| `id` | UUID primary key |
+| `campaign_id` | FK to `campaigns.id`; groups entries from one Orchestrator dispatch |
+| `source` | `direct` / `random` / `mutator` / `regression` (shared `attack_source` enum) |
+| `category / subcategory / channel` | Denormalized for fast filter |
+| `attack_prompt`, `multi_turn_seq` | The attack payload |
+| `parent_id` | FK to `attack_runs.id` for mutator / class-probe / regression sources |
+| `priority_score` | See §6 |
+| `state` | `queued` / `dispatching` / `dispatched` / `failed` / `cancelled` |
+| `enqueued_at`, `dispatched_at` | Lifecycle timestamps |
+| `attack_run_id` | FK to `attack_runs.id` after dispatch |
+| `failure_reason` | Populated if `state='failed'` |
 
-The partial index on `state='queued'` keeps the dispatch poll cheap
-even at 100K+ historical entries.
+Postgres uses a partial index on `state='queued'` so the dispatch
+poll stays cheap even at 100K+ historical entries.
 
 ---
 

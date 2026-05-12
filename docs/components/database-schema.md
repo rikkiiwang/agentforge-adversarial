@@ -1,8 +1,12 @@
 # Postgres schema
 
-**Status:** Design-of-record, draft 2026-05-11. The 6 tables here are the
-**single source of truth** for the platform. Referenced from
-`ARCHITECTURE.md` §6 and `docs/agents/documentation-agent.md` §3.
+**Status:** Design-of-record, draft 2026-05-11; updated 2026-05-12 to
+add `attack_queue`, `campaigns`, `cross_regressions`, and the
+`cost_rollup_daily` materialized view. **9 tables + 1 materialized
+view** comprise the single source of truth for the platform.
+Referenced from `ARCHITECTURE.md` §6, `docs/agents/documentation-agent.md`
+§3, `docs/agents/orchestrator.md` §3, `docs/components/regression-harness.md` §6,
+`docs/components/observability.md` §5, and `docs/components/attack-queue.md` §3.
 
 ---
 
@@ -44,22 +48,51 @@ CREATE TABLE attack_runs (
   red_team_model       text        NOT NULL,                   -- e.g., "llama-3-70b-uncensored"
   attack_prompt        text        NOT NULL,                   -- the actual attack text
   transcript_uri       text,                                   -- pointer to full transcript in object store
-  judge_verdict        judge_verdict NOT NULL,
-  judge_reasoning      text        NOT NULL,
-  judge_rubric_version text        NOT NULL,                   -- for drift detection
-  category_validated   boolean     NOT NULL,                   -- did declared category match observed behavior
+
+  -- Judge-written columns. NULL between dispatch and judgment completion
+  -- (or permanently NULL if the Judge crashed before writing). Dashboard
+  -- "stuck attacks" tile surfaces rows where judge_verdict IS NULL more
+  -- than `JUDGE_STUCK_THRESHOLD` minutes after `created_at`.
+  judge_verdict        judge_verdict,                          -- NULL until Judge writes
+  judge_reasoning      text,                                   -- NULL until Judge writes
+  judge_rubric_version text,                                   -- NULL until Judge writes; for drift detection
+  category_validated   boolean,                                -- NULL until Judge writes
+  judged_at            timestamptz,                            -- NULL until Judge writes
+
   cost_usd             numeric(10,4) NOT NULL,
   latency_ms           integer     NOT NULL,
   langfuse_trace_id    text,
   embedding            vector(384),                            -- pgvector; for novelty / dedup
-  created_at           timestamptz NOT NULL DEFAULT now()
+  created_at           timestamptz NOT NULL DEFAULT now(),
+
+  -- All Judge fields are written atomically: either every Judge column
+  -- is set, or none of them are. Prevents partial-write states where
+  -- e.g. verdict is set but reasoning is NULL.
+  CONSTRAINT attack_runs_judge_atomic CHECK (
+    (judge_verdict IS NULL
+       AND judge_reasoning IS NULL
+       AND judge_rubric_version IS NULL
+       AND category_validated IS NULL
+       AND judged_at IS NULL)
+    OR
+    (judge_verdict IS NOT NULL
+       AND judge_reasoning IS NOT NULL
+       AND judge_rubric_version IS NOT NULL
+       AND category_validated IS NOT NULL
+       AND judged_at IS NOT NULL)
+  )
 );
 
 CREATE INDEX attack_runs_target_version_idx ON attack_runs (target_version);
 CREATE INDEX attack_runs_category_idx ON attack_runs (category, subcategory, channel);
 CREATE INDEX attack_runs_campaign_idx ON attack_runs (campaign_id);
 CREATE INDEX attack_runs_parent_idx ON attack_runs (parent_id);
-CREATE INDEX attack_runs_verdict_idx ON attack_runs (judge_verdict);
+CREATE INDEX attack_runs_verdict_idx ON attack_runs (judge_verdict)
+  WHERE judge_verdict IS NOT NULL;
+
+-- Partial index for the "stuck attacks" dashboard tile
+CREATE INDEX attack_runs_stuck_idx ON attack_runs (created_at)
+  WHERE judge_verdict IS NULL;
 
 -- pgvector HNSW for novelty filtering (synthesis stage 4)
 CREATE INDEX attack_runs_embedding_hnsw_idx ON attack_runs
@@ -275,6 +308,164 @@ The `defenses_referenced` JSON shape mirrors what's declared in
 
 ---
 
+## 7. `attack_queue`
+
+Postgres-backed FIFO of attacks ready to dispatch. Distinct from
+`attack_runs` — `attack_queue` is the *pre-dispatch* buffer; once an
+attack is dispatched + judged, its row in `attack_queue` reaches
+terminal state and the persistent record lives in `attack_runs`.
+
+Detail: `docs/components/attack-queue.md`.
+
+```sql
+CREATE TYPE queue_state AS ENUM (
+  'queued', 'dispatching', 'dispatched', 'failed', 'cancelled'
+);
+
+CREATE TABLE attack_queue (
+  id              uuid           PRIMARY KEY DEFAULT uuid_generate_v4(),
+  campaign_id     uuid           NOT NULL REFERENCES campaigns(id),
+  source          attack_source  NOT NULL,
+  category        text           NOT NULL,
+  subcategory     text           NOT NULL,
+  channel         text           NOT NULL,
+  attack_prompt   text           NOT NULL,
+  multi_turn_seq  jsonb,                          -- null for single-turn
+  parent_id       uuid           REFERENCES attack_runs(id),
+  priority_score  real           NOT NULL,
+  state           queue_state    NOT NULL DEFAULT 'queued',
+  enqueued_at     timestamptz    NOT NULL DEFAULT now(),
+  dispatched_at   timestamptz,
+  attack_run_id   uuid           REFERENCES attack_runs(id),    -- populated after dispatch
+  failure_reason  text                                          -- populated if state='failed'
+);
+
+-- Partial index keeps dispatch poll cheap even at 100K+ historical entries
+CREATE INDEX attack_queue_dispatch_ready_idx
+  ON attack_queue (state, priority_score DESC, enqueued_at)
+  WHERE state = 'queued';
+```
+
+---
+
+## 8. `campaigns`
+
+Audit trail of every Orchestrator dispatch. One row per
+`CampaignBrief`. Lets any future operator answer "why did the
+platform run this campaign on 2026-05-15?" by replaying the same
+state inputs through the same Orchestrator version.
+
+Written by the Orchestrator's dispatch node (verbatim from
+`CampaignBrief`). Read by the dashboard, the Regression Harness
+(when the post-verdict routing needs the original brief), and
+audit / compliance tools.
+
+```sql
+CREATE TYPE campaign_trigger AS ENUM (
+  'scoring', 'regression_due', 'new_target_version', 'manual'
+);
+
+CREATE TYPE seed_strategy AS ENUM (
+  'random', 'mutator', 'direct', 'regression'
+);
+
+CREATE TABLE campaigns (
+  id                         uuid             PRIMARY KEY DEFAULT uuid_generate_v4(),
+  target_version             text             NOT NULL,
+  category                   text             NOT NULL,
+  subcategory                text             NOT NULL,
+  channel                    text             NOT NULL,
+  budget_usd                 numeric(10,4)    NOT NULL,
+  seed_strategy              seed_strategy    NOT NULL,
+  seed_attack_ids            uuid[]           NOT NULL DEFAULT '{}',
+  swarm_recommendation       jsonb            NOT NULL,   -- the Orchestrator's proposal
+  swarm_actually_dispatched  jsonb            NOT NULL,   -- after operator approval / override
+  scoring_breakdown          jsonb            NOT NULL,   -- per-signal contributions
+  trigger                    campaign_trigger NOT NULL,
+  orchestrator_version       text             NOT NULL,
+  scoring_weights_version    text             NOT NULL,
+  langfuse_trace_id          text,
+  dispatched_at              timestamptz      NOT NULL DEFAULT now(),
+  completed_at               timestamptz                   -- NULL while in flight
+);
+
+CREATE INDEX campaigns_target_version_idx ON campaigns (target_version);
+CREATE INDEX campaigns_category_idx       ON campaigns (category, subcategory);
+CREATE INDEX campaigns_inflight_idx       ON campaigns (dispatched_at)
+  WHERE completed_at IS NULL;
+```
+
+---
+
+## 9. `cross_regressions`
+
+Events written by the Regression Harness when a full-sweep replay
+detects a vuln that had previously passed on some version now fails
+on the current `target_version` — i.e., a fix elsewhere broke
+something here. See `docs/components/regression-harness.md` §6.
+
+Each row is a discrete event (one detection); the lifecycle then
+moves through dashboard acknowledgement.
+
+```sql
+CREATE TABLE cross_regressions (
+  id                       uuid           PRIMARY KEY DEFAULT uuid_generate_v4(),
+  vuln_id                  uuid           NOT NULL REFERENCES vulnerabilities(id),
+  prior_passed_version     text           NOT NULL,                 -- version where the fix had held
+  current_target_version   text           NOT NULL,                 -- version where it now fails
+  triggering_attack_run_id uuid           NOT NULL REFERENCES attack_runs(id),
+  triggering_campaign_id   uuid           REFERENCES campaigns(id), -- the sweep that detected it
+  severity_baseline        vuln_severity  NOT NULL,
+  detected_at              timestamptz    NOT NULL DEFAULT now(),
+  acknowledged_at          timestamptz,                              -- operator clicks "ack" in dashboard
+  acknowledged_by          text,
+  notes                    text
+);
+
+CREATE INDEX cross_regressions_unack_idx ON cross_regressions (detected_at)
+  WHERE acknowledged_at IS NULL;
+CREATE INDEX cross_regressions_vuln_idx  ON cross_regressions (vuln_id);
+```
+
+---
+
+## 10. `cost_rollup_daily` (materialized view)
+
+Daily cost rollup over `attack_runs`. Computed (not maintained by hand)
+so it stays consistent with the source data. The dashboard's cost tile
+and the Orchestrator's per-category daily-pool tracker both read this
+view (per `docs/components/observability.md` §5 and
+`docs/agents/orchestrator.md` §6).
+
+```sql
+CREATE MATERIALIZED VIEW cost_rollup_daily AS
+SELECT
+  date_trunc('day', created_at AT TIME ZONE 'UTC')      AS rollup_day,
+  category,
+  red_team_model,
+  count(*)                                              AS run_count,
+  sum(cost_usd)                                         AS total_cost_usd,
+  count(*) FILTER (WHERE judge_verdict = 'fail')        AS fail_count,
+  count(*) FILTER (WHERE judge_verdict = 'partial')     AS partial_count,
+  count(*) FILTER (WHERE judge_verdict = 'pass')        AS pass_count,
+  sum(cost_usd) FILTER (WHERE judge_verdict = 'fail')   AS fail_cost_usd
+FROM attack_runs
+WHERE judge_verdict IS NOT NULL                          -- exclude stuck rows
+GROUP BY rollup_day, category, red_team_model;
+
+CREATE UNIQUE INDEX cost_rollup_daily_axis_idx
+  ON cost_rollup_daily (rollup_day, category, red_team_model);
+
+-- Refresh every 60s via a pg_cron job (or platform-side scheduler)
+-- REFRESH MATERIALIZED VIEW CONCURRENTLY cost_rollup_daily;
+```
+
+The view is refreshed every 60s (the cadence the dashboard tile and
+Orchestrator can both tolerate). `CONCURRENTLY` requires the unique
+index to avoid blocking reads during refresh.
+
+---
+
 ## Cross-table integrity
 
 - A `vulnerabilities` row's `parent_vuln_id` must point to a vuln in the
@@ -284,6 +475,17 @@ The `defenses_referenced` JSON shape mirrors what's declared in
 - A `regression_schedule.vuln_id` must reference a vuln whose
   `originating_attack_run_id` matches the schedule's `attack_run_id`.
   Enforced by trigger.
+- An `attack_runs` row's Judge-written columns are all-or-nothing
+  (`attack_runs_judge_atomic` CHECK constraint declared inline in §1).
+  A row with `judge_verdict IS NULL` is a "stuck attack" and may
+  represent either an in-flight judgment or a crashed Judge node.
+- A `cross_regressions` row's `triggering_attack_run_id` must have
+  `judge_verdict = 'fail'` (cross-regressions are only detected on
+  re-failures). Enforced by trigger.
+- A `campaigns.swarm_actually_dispatched` JSON shape must conform to
+  the same `SwarmRecommendation` Pydantic model used at dispatch
+  (i.e., the operator's modifications must still be valid swarm
+  specs). Validated in application layer, not DB.
 
 Detail of trigger SQL goes into the first Alembic migration.
 

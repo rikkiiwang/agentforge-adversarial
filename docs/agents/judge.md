@@ -53,6 +53,12 @@ sets:
 - `judge_reasoning` text — JSON with `triggered_rule`, `predicates`, `ensemble_models` (if applicable), and free-text rationale
 - `judge_rubric_version` text — copied from `app.agents.judge.RUBRIC_VERSION` at evaluation time
 - `category_validated` bool — see §8
+- `judged_at` timestamptz — Judge's write time; together with `created_at` (dispatch time) gives total queue-to-verdict latency
+
+All five Judge columns are written **atomically** (the schema's
+`attack_runs_judge_atomic` CHECK constraint enforces this). A crashed
+Judge leaves all five as `NULL`; the row remains in the "stuck"
+state, surfaced by the dashboard's stuck-attacks tile.
 
 The Judge does **not** write to `vulnerabilities`, `vuln_reports`,
 `near_misses`, `regression_schedule`, or `threat_model_cells`. Those
