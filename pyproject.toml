@@ -1,0 +1,33 @@
+[project]
+name = "agentforge-adversarial"
+version = "0.1.0"
+description = "Adversarial AI security platform that attacks deployed OpenEMR Clinical Co-Pilot"
+requires-python = ">=3.11"
+dependencies = [
+  "httpx>=0.27",
+  "pydantic>=2.7",
+  "pyyaml>=6.0",
+  "asyncpg>=0.29",
+  "psycopg[binary]>=3.2",
+  "openai>=1.40",
+  "streamlit>=1.36",
+  "pandas>=2.0",
+  "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["agentforge_adversarial*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
