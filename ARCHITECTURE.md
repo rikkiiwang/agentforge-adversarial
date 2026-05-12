@@ -49,9 +49,13 @@ weighted scoring, and budget-capped greedy selection with subagent and
 channel diversity floors. Mirrors the W2 precedent that the supervisor is
 plain Python (W2_ARCHITECTURE §4.1). Cheap, deterministic, replayable.
 
-Post-attack, the Judge writes to **Postgres** — the single source of truth
-across six tables (`attack_runs`, `vulnerabilities`, `vuln_reports`,
-`near_misses`, `regression_schedule`, `threat_model_cells`). The dashboard
+The dispatcher writes a new `attack_runs` row to **Postgres** when it
+executes each attack against the target; the Judge UPDATEs the same
+row atomically once it produces a verdict. Postgres is the single
+source of truth across **nine tables** — `attack_runs`,
+`vulnerabilities`, `vuln_reports`, `near_misses`, `regression_schedule`,
+`threat_model_cells`, `campaigns`, `attack_queue`, `cross_regressions` —
+plus one materialized view (`cost_rollup_daily`). The dashboard
 renders three views on top: a coverage heat-map (rows = categories,
 columns = subcategories), a near-miss tile (active partials under
 exploration), and a vulnerability board with a state machine
@@ -171,7 +175,7 @@ conflict of interest in adversarial evaluation.
               ▼                                           ▼
       ┌──────────────────┐                        ┌──────────────────┐
       │  POSTGRES        │                        │  LANGFUSE        │
-      │  (6 tables)      │                        │  (traces, costs) │
+      │  (9 tables + 1 view) │                    │  (traces, costs) │
       └─────────┬────────┘                        └──────────────────┘
                 │
                 ▼
@@ -277,7 +281,7 @@ Three layers, by lifetime:
 | Layer | Lifetime | Backed by | Carries |
 |---|---|---|---|
 | **In-run state** | One campaign run | LangGraph `StateGraph` typed dict | Campaign brief, swarm outputs, synthesized attacks, transcripts, verdicts |
-| **Cross-run history** | Forever | Postgres | All durable rows: `attack_runs`, `vulnerabilities`, `near_misses`, `vuln_reports`, `regression_schedule`, `threat_model_cells` |
+| **Cross-run history** | Forever | Postgres | All durable rows: `attack_runs`, `vulnerabilities`, `vuln_reports`, `near_misses`, `regression_schedule`, `threat_model_cells`, `campaigns`, `attack_queue`, `cross_regressions` (9 tables) + `cost_rollup_daily` view |
 | **Observability** | Indefinite | Langfuse Cloud | Per-agent traces, token spans, cost spans, inter-agent message log, replay-by-vuln-id |
 
 Agents do **not** call each other directly. All hand-offs go through the
@@ -290,15 +294,17 @@ still operate on.
 
 ## 6. Persistence — Postgres schema
 
-Six core tables. Full schema with migrations in
-`docs/components/database-schema.md`. Sketch:
+**Nine tables + one materialized view.** Full schema with migrations in
+`docs/components/database-schema.md` (which presents them in
+dependency-safe order). Sketch:
 
-- **`attack_runs`** — one row per attack execution. The canonical record.
-  Columns include `id`, `target_version`, `category`, `subcategory`,
-  `channel`, `parent_id`, `seed_id`, `source` (direct / random / mutator /
-  regression), `red_team_model`, `judge_verdict`, `judge_reasoning`,
-  `category_validated`, `cost_usd`, `latency_ms`, `transcript_uri`,
-  `langfuse_trace_id`, `embedding` (pgvector), `created_at`.
+- **`attack_runs`** — one row per attack execution. The canonical
+  record. Written in two phases: the **dispatcher INSERTs** with
+  transcript / cost / latency / `queue_entry_id` /
+  `dispatcher_version` / provenance fields copied from the queue
+  entry; Judge columns are NULL at this point. The **Judge UPDATEs**
+  the Judge columns atomically (enforced by the
+  `attack_runs_judge_atomic` CHECK constraint).
 
 - **`vulnerabilities`** — confirmed exploits in the state machine.
   References `attack_runs.id` for the origin. *Written by Documentation
@@ -320,8 +326,31 @@ Six core tables. Full schema with migrations in
 - **`threat_model_cells`** — the structured taxonomy. Versioned. Drives
   the heat-map columns + quality bars.
 
-A `pgvector` index on `attack_runs.embedding` enables sub-100ms novelty
-filtering against ~100K historical attacks (synthesis stage 4).
+- **`campaigns`** — audit trail of every Orchestrator dispatch. One row
+  per `CampaignBrief`. Lets any future operator answer *"why did the
+  platform run this campaign on 2026-05-15?"*
+
+- **`attack_queue`** — pre-dispatch FIFO. Fed by synthesis, mutator,
+  class-probe, and the regression harness. The dispatcher consumes
+  it and INSERTs the matching `attack_runs` row. **The only path
+  attacks reach the target through.** Carries provenance fields
+  (`red_team_subagent_id`, `red_team_model`, `expected_failure_mode`,
+  optional `harness_version`) so the dispatcher can produce a valid
+  `attack_runs` row without inventing values.
+
+- **`cross_regressions`** — events written when the harness's full
+  sweep detects a vuln that previously passed on some version now
+  fails on the current `target_version` (i.e., a fix elsewhere broke
+  something here). One row per detection; acknowledgement is human-
+  driven via the dashboard.
+
+- **`cost_rollup_daily`** (materialized view) — daily cost rollup over
+  `attack_runs` by `(category, red_team_model)`. Consumed by the
+  dashboard's cost tile and the Orchestrator's per-category daily-
+  pool tracker. Refreshed every 60 seconds.
+
+A `pgvector` HNSW index on `attack_runs.embedding` enables sub-100ms
+novelty filtering against ~100K historical attacks (synthesis stage 4).
 
 ---
 

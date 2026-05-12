@@ -95,11 +95,22 @@ set `regression_schedule.enabled = false` from the dashboard (see §8).
    │                                   │
    │   1. Load original attack_runs    │
    │      row by attack_run_id         │
-   │   2. ENQUEUE attack_queue row:    │
+   │   2. ENQUEUE attack_queue row,    │
+   │      copying these fields         │
+   │      verbatim from the parent     │
+   │      attack_runs row:             │
+   │        attack_prompt              │
+   │        multi_turn_seq             │
+   │        category / subcategory /   │
+   │          channel                  │
+   │        red_team_subagent_id       │
+   │        red_team_model             │
+   │        expected_failure_mode      │
+   │      plus harness-set fields:     │
    │        source='regression'        │
-   │        parent_id=<original>       │
-   │        + prompt + cat + channel   │
-   │        + harness_version metadata │
+   │        parent_id=<original.id>    │
+   │        harness_version            │
+   │        priority_score             │
    │      (harness never writes        │
    │       attack_runs directly)       │
    │   3. Dispatcher consumes the      │

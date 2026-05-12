@@ -69,9 +69,10 @@ CREATE TABLE attack_runs (
   seed_id              text,                                   -- root seed (for lineage); null for first-ever
   parent_id            uuid        REFERENCES attack_runs(id), -- mutator chain; null for seeds
   source               attack_source NOT NULL,
-  red_team_subagent_id text        NOT NULL,                   -- which swarm subagent generated it
-  red_team_model       text        NOT NULL,                   -- e.g., "llama-3-70b-uncensored"
-  attack_prompt        text        NOT NULL,                   -- the actual attack text
+  red_team_subagent_id text        NOT NULL,                   -- which swarm subagent (or 'mutator' / 'regression-harness' / 'direct-seed') generated it; copied from attack_queue
+  red_team_model       text        NOT NULL,                   -- e.g., "llama-3-70b-uncensored"; copied from attack_queue
+  attack_prompt        text        NOT NULL,                   -- the actual attack text; copied from attack_queue
+  expected_failure_mode text       NOT NULL,                   -- declared success criterion; copied from attack_queue, read by Judge for category validation + by Doc Agent for vuln reports
   transcript_uri       text,                                   -- pointer to full transcript in object store
 
   -- Queue → runs idempotency. Set by the dispatcher at INSERT time.
@@ -432,21 +433,40 @@ CREATE TYPE queue_state AS ENUM (
 );
 
 CREATE TABLE attack_queue (
-  id              uuid           PRIMARY KEY DEFAULT uuid_generate_v4(),
-  campaign_id     uuid           NOT NULL REFERENCES campaigns(id),
-  source          attack_source  NOT NULL,
-  category        text           NOT NULL,
-  subcategory     text           NOT NULL,
-  channel         text           NOT NULL,
-  attack_prompt   text           NOT NULL,
-  multi_turn_seq  jsonb,                          -- null for single-turn
-  parent_id       uuid           REFERENCES attack_runs(id),
-  priority_score  real           NOT NULL,
-  state           queue_state    NOT NULL DEFAULT 'queued',
-  enqueued_at     timestamptz    NOT NULL DEFAULT now(),
-  dispatched_at   timestamptz,
-  attack_run_id   uuid           REFERENCES attack_runs(id),    -- populated after dispatch; uniqueness lives on attack_runs.queue_entry_id
-  failure_reason  text                                          -- populated if state='failed'
+  id                   uuid           PRIMARY KEY DEFAULT uuid_generate_v4(),
+  campaign_id          uuid           NOT NULL REFERENCES campaigns(id),
+  source               attack_source  NOT NULL,
+  category             text           NOT NULL,
+  subcategory          text           NOT NULL,
+  channel              text           NOT NULL,
+  attack_prompt        text           NOT NULL,
+  multi_turn_seq       jsonb,                                  -- null for single-turn
+  parent_id            uuid           REFERENCES attack_runs(id),
+
+  -- Provenance fields. Required to be set by the producer at enqueue
+  -- time so the dispatcher can INSERT a valid attack_runs row without
+  -- inventing values. The dispatcher copies these verbatim into the
+  -- attack_runs columns of the same name.
+  red_team_subagent_id text           NOT NULL,                -- which subagent (or 'mutator' / 'regression-harness' / 'direct-seed') produced this
+  red_team_model       text           NOT NULL,                -- the LLM behind that producer (or 'n/a' for non-LLM producers)
+  expected_failure_mode text          NOT NULL,                -- declared success criterion; Judge reads this for category validation
+
+  priority_score       real           NOT NULL,
+  state                queue_state    NOT NULL DEFAULT 'queued',
+  enqueued_at          timestamptz    NOT NULL DEFAULT now(),
+  dispatched_at        timestamptz,
+  attack_run_id        uuid           REFERENCES attack_runs(id),    -- populated after dispatch; uniqueness lives on attack_runs.queue_entry_id
+  failure_reason       text,                                          -- populated if state='failed'
+
+  -- Audit metadata recorded by the Regression Harness at enqueue.
+  -- The dispatcher copies this verbatim to attack_runs.harness_version.
+  harness_version      text,                                          -- NULL except when source='regression'
+
+  CONSTRAINT attack_queue_harness_version_source_match CHECK (
+    (source = 'regression' AND harness_version IS NOT NULL)
+    OR
+    (source <> 'regression' AND harness_version IS NULL)
+  )
 );
 
 -- Partial index keeps dispatch poll cheap even at 100K+ historical entries
@@ -464,6 +484,24 @@ ALTER TABLE attack_runs
   REFERENCES attack_queue(id)
   DEFERRABLE INITIALLY DEFERRED;
 ```
+
+**Per-source provenance rules** for `red_team_subagent_id`,
+`red_team_model`, and `expected_failure_mode` (all NOT NULL on
+`attack_queue`):
+
+| `source` | `red_team_subagent_id` | `red_team_model` | `expected_failure_mode` |
+|---|---|---|---|
+| `random` | The subagent id from `config/swarm.yaml` that produced this attack | The subagent's configured model | Emitted in the subagent's structured output |
+| `direct` | `'direct-seed'` (literal) | `'n/a'` | Set in the seed fixture file (`evals/seeds/<category>/*.yaml`) |
+| `mutator` | The mutator's id (`'mutator-<subagent-id>'`) | The mutator's model | Emitted by the mutator (often a refinement of the parent's `expected_failure_mode`) |
+| `regression` | **Copied verbatim from the parent `attack_runs` row** (the originally-found exploit) | **Copied verbatim from the parent** | **Copied verbatim from the parent** — replays must score against the same success criterion as the original |
+
+The Regression Harness reads
+`attack_runs.{red_team_subagent_id, red_team_model, expected_failure_mode}`
+of the originating exploit when enqueuing a replay, and copies them
+into the new `attack_queue` row. This preserves provenance through
+the regression chain and ensures the Judge applies the same success
+criterion across the lifetime of a vulnerability.
 
 ---
 
@@ -570,6 +608,20 @@ index to avoid blocking reads during refresh.
 - `attack_queue.attack_run_id` is a denormalization for lookup
   convenience. The authoritative uniqueness lives on
   `attack_runs.queue_entry_id`, not here.
+- `attack_queue.harness_version` is set if and only if
+  `source='regression'` (enforced by the inline
+  `attack_queue_harness_version_source_match` CHECK). The dispatcher
+  copies it verbatim to `attack_runs.harness_version`, where the
+  matching `attack_runs_harness_version_source_match` CHECK enforces
+  the same biconditional on the dispatched row.
+- `attack_queue.{red_team_subagent_id, red_team_model,
+  expected_failure_mode}` are `NOT NULL` and are copied verbatim into
+  the matching `attack_runs` columns at dispatch. The producer is
+  responsible for filling them per the per-source provenance rules
+  table in §8. Specifically: a `source='regression'` enqueue **must**
+  copy these three fields from the originating `attack_runs` row
+  (enforced by application logic, not the schema, because the
+  `parent_id` link permits but does not require this copy).
 
 Detail of trigger SQL goes into the first Alembic migration.
 

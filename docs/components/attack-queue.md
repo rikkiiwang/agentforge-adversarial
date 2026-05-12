@@ -43,10 +43,10 @@ Each entry carries the source tag (`direct`, `random`, `mutator`,
 A dedicated `attack_queue` table (separate from `attack_runs` —
 `attack_runs` is the persistent record after dispatch+judge).
 
-**Canonical DDL lives in `docs/components/database-schema.md` §7.**
-This file only summarizes the fields conceptually so future readers
-don't need to chase the schema doc to understand what each entry
-carries.
+**Canonical DDL lives in `docs/components/database-schema.md` §8**
+(post-reorder; was §7 before campaigns was moved ahead). This file
+summarizes the fields conceptually so future readers don't need to
+chase the schema doc to understand what each entry carries.
 
 Per-entry fields:
 
@@ -58,11 +58,14 @@ Per-entry fields:
 | `category / subcategory / channel` | Denormalized for fast filter |
 | `attack_prompt`, `multi_turn_seq` | The attack payload |
 | `parent_id` | FK to `attack_runs.id` for mutator / class-probe / regression sources |
+| **`red_team_subagent_id`, `red_team_model`** | Provenance, NOT NULL. The producer fills these at enqueue time; the dispatcher copies them verbatim to `attack_runs`. See the per-source provenance rules in `database-schema.md` §8 — for `source='regression'`, these are copied from the parent `attack_runs` row. |
+| **`expected_failure_mode`** | Declared success criterion (NOT NULL). Produced by Red Team subagents in their structured output, by mutators as a refined claim, by seed fixtures for `direct`, or copied from parent for `regression`. The Judge reads this to validate category claims and the Documentation Agent reads it to fill `vuln_reports.expected_behavior`. |
 | `priority_score` | See §6 |
 | `state` | `queued` / `dispatching` / `dispatched` / `failed` / `cancelled` |
 | `enqueued_at`, `dispatched_at` | Lifecycle timestamps |
-| `attack_run_id` | FK to `attack_runs.id` after dispatch |
+| `attack_run_id` | FK to `attack_runs.id` after dispatch (denormalization; uniqueness lives on `attack_runs.queue_entry_id`) |
 | `failure_reason` | Populated if `state='failed'` |
+| **`harness_version`** | NULL except when `source='regression'`. Set by the Regression Harness at enqueue time; dispatcher copies to `attack_runs.harness_version`. The schema's `attack_queue_harness_version_source_match` CHECK enforces the biconditional. |
 
 Postgres uses a partial index on `state='queued'` so the dispatch
 poll stays cheap even at 100K+ historical entries.
@@ -113,15 +116,27 @@ async def dispatch_one(entry):
 ```
 
 **`write_attack_run` is the canonical INSERT of an `attack_runs` row.**
-The dispatcher writes the transcript, cost, latency, embedding,
-`queue_entry_id` (pointing at `entry.id`), `dispatcher_version`, and
-— if the queue entry's `source = 'regression'` — `harness_version`
-copied from the queue entry's metadata. **Judge columns stay `NULL`**
-until the Judge LangGraph node UPDATEs them in a separate flow
-(`docs/agents/judge.md` §3). The `attack_runs.queue_entry_id UNIQUE`
-constraint (`docs/components/database-schema.md` §1) prevents
-duplicate inserts on a dispatcher retry — the second INSERT fails
-at the database level.
+The dispatcher copies these columns verbatim from the queue entry:
+`source`, `category`, `subcategory`, `channel`, `parent_id`,
+`red_team_subagent_id`, `red_team_model`, `attack_prompt`,
+`expected_failure_mode`, and `harness_version` (NULL unless
+`source='regression'`). It adds:
+
+- `id` (fresh uuid), `created_at` (now)
+- `target_version` (current `/healthz` SHA)
+- `campaign_id` (copied from the queue entry's campaign)
+- `transcript_uri`, `cost_usd`, `latency_ms`, `embedding`,
+  `langfuse_trace_id` (results of the target execution)
+- `queue_entry_id` = `entry.id` (the idempotency key)
+- `dispatcher_version` (current `QUEUE_VERSION`)
+
+`seed_id` is set if known from the campaign brief. **Judge columns
+stay `NULL`** until the Judge LangGraph node UPDATEs them in a
+separate flow (`docs/agents/judge.md` §3). The
+`attack_runs.queue_entry_id UNIQUE` constraint
+(`docs/components/database-schema.md` §1) prevents duplicate inserts
+on a dispatcher retry — the second INSERT fails at the database
+level.
 
 After the attack_runs row is written, the Judge LangGraph node
 picks up the row (separate flow). The queue entry's purpose ends at
