@@ -45,8 +45,8 @@ def fetch_runs() -> pd.DataFrame:
         )
 
 
-st.set_page_config(page_title="AgentForge Adversarial Dashboard", layout="wide")
-st.title("AgentForge Adversarial — MVP Dashboard")
+st.set_page_config(page_title="AI Security Platform Dashboard", layout="wide")
+st.title("AI Security Platform Dashboard")
 header_bits = [
     f"DB: **{DEPLOY_ENV}**",
 ]
