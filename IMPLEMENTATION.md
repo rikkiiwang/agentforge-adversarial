@@ -1,7 +1,7 @@
 # AgentForge Adversarial — Implementation Status
 
-**Submission date:** 2026-05-12
-**MVP commit:** `513ee25` (visible on both [GitHub](https://github.com/rikkiiwang/agentforge-adversarial) and [GitLab](https://labs.gauntletai.com/ruijingwang/agentforge-adversarial))
+**Submission date:** 2026-05-12 (MVP) · revised 2026-05-12 (operator console partial + auto-auth)
+**MVP commit:** `513ee25` (initial MVP); operator-console Launch panel + auto-auth added in a follow-up commit on the same day.
 **Deployed dashboard:** https://agentforge-adversarial-production.up.railway.app/
 **Target under test:** https://copilot-production-b532.up.railway.app/
 
@@ -22,7 +22,7 @@ deferred item.
 |---|---|
 | Hard gate: 3+ attack categories | ✅ 8 categories shipped |
 | Hard gate: agent prototype running live against deployed target | ✅ Red Team mutator + Ensemble Judge, hits live Co-Pilot |
-| Hard gate: working test suite | ✅ 28 tests pass (`make test`) |
+| Hard gate: working test suite | ✅ 30 tests pass (`make test`) |
 | Hard gate: results visible to reviewer | ✅ public dashboard reads from Railway Postgres |
 
 ---
@@ -53,7 +53,7 @@ Mapped to the section numbers in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 | **Observability** | ⚠️ Partial | Stdout logging from `runner.py` only. **Missing for final:** Langfuse traces (one trace per campaign with generation spans), per-attack `langfuse_trace_id` column populated. |
 | **Postgres schema** | ⚠️ Partial | 3 of 9 designed tables (`campaigns`, `attack_queue`, `attack_runs`). Subset of `docs/components/database-schema.md` §1-§8. **Missing for final:** `vulnerabilities`, `vuln_reports`, `near_misses`, `cross_regressions`, `threat_model_cells`, `cost_rollup_daily` (view). |
 | **pgvector novelty filter** | ❌ Deferred | Designed for HNSW dedup on embeddings. Not used; mutator produces N variants without deduplication. |
-| **Operator console (in-dashboard campaign launch)** | ❌ Deferred | Currently dashboard is a viewer; campaigns are triggered via CLI (`make run-live`). Final adds target selector + swarm config + Launch button + live-stream updates. |
+| **Operator console (in-dashboard campaign launch)** | 🟡 Partial (Launch panel shipped 2026-05-12) | "▶ Run campaign" button in Streamlit (`dashboard/app.py:71-139`) spawns a subprocess via `dashboard/launcher.py`, shows a live progress bar (5s meta-refresh while in-flight), and auto-refreshes the heat-map on completion. Target = Mock or Live (deployed Co-Pilot via auto-created session, no manual `session_id`). **Missing for final:** Approve/Modify/Override gate per `docs/components/dashboard.md §4.1`, Vuln Board, swarm-config picker. |
 
 ### Orchestration framework (`ARCHITECTURE.md` §3, §4)
 
@@ -109,14 +109,15 @@ they exist.
 Prioritized by demo-credibility-per-hour, with effort estimates. Final
 submission should aim for everything in P0 + P1; P2 is bonus.
 
-### P0 — operator console + LangGraph (the biggest visual gap)
+### P0 — LangGraph + remaining operator-console gates
 
 | Item | Effort | What it unlocks |
 |---|---|---|
 | LangGraph node/edge skeleton wrapping the existing `runner.py` flow | 3-4 h | Foundation for the rest of P0. Same behavior, graph-shaped. |
-| In-dashboard Launch button (target selector + swarm config + Categories multiselect + "Launch Campaign") | 4-5 h | Operator-driven flow per `docs/components/dashboard.md`. Removes the "viewer-only" criticism. |
-| Live-stream updates as campaign runs (Streamlit polling Postgres for new rows in active campaign) | 2 h | Demo video shows attacks streaming in real-time. |
-| Conditional edges: `PARTIAL → Mutator re-entry`, `FAIL → Class-probe fan-out (10 boundary variants)` | 4 h | Where LangGraph actually earns its keep. Produces the variant-chain effect described in `ARCHITECTURE.md` §4. |
+| ~~In-dashboard Launch button + live progress~~ | ✅ ~~6-7 h~~ Shipped 2026-05-12 | Streamlit Launch panel + subprocess launcher + 5s meta-refresh while in-flight. |
+| Swarm-config picker on Launch panel (model + variant count + budget) per `docs/components/dashboard.md §4.1` | 1.5 h | Operator can override defaults per campaign without editing YAML. |
+| Approve/Modify/Override gate UI (when `swarm_approval_mode != 'auto'`) | 2 h | Per `docs/components/dashboard.md §4.1`. The full §4.1 trust contract. |
+| Conditional edges: `PARTIAL → Mutator re-entry`, `FAIL → Class-probe fan-out (10 boundary variants)` | 4 h | Where LangGraph actually earns its keep. Produces the variant-chain effect described in `ARCHITECTURE.md §4`. |
 
 ### P1 — Documentation Agent + vuln lifecycle
 
@@ -158,20 +159,30 @@ submission should aim for everything in P0 + P1; P2 is bonus.
 | `agentforge_adversarial/judges/llm_judge.py` | gpt-4o-mini Judge — category-general SYSTEM_PROMPT, takes `expected_failure_mode` from seed as the per-category rubric. |
 | `agentforge_adversarial/judges/ensemble.py` | Combines keyword + LLM (every category), UPDATEs `attack_runs` atomically. |
 | `agentforge_adversarial/red_team/mutator.py` | One Red Team subagent — gpt-4o-mini, produces 3 mutations per seed. |
-| `dashboard/app.py` | Streamlit dashboard, reads Postgres via `psycopg`. |
+| `agentforge_adversarial/target.py` | `CopilotClient` (auto-creates session via `POST /v1/sessions`, 404-retry) + `MockCopilotClient` (deliberately-vulnerable test double). |
+| `dashboard/app.py` | Streamlit dashboard, reads Postgres via `psycopg`. Includes the Launch panel (`§4.1` partial). |
+| `dashboard/launcher.py` | Subprocess-based campaign runner used by the Launch panel. |
 | `migrations/001_initial.sql` | 3 tables + atomic CHECK + DEFERRABLE FK. Strict subset of full schema design. |
 | `evals/cases/*.yaml` | 8 seed test cases (1 per shipped category). |
-| `tests/` | 28 passing tests — unit + live-Postgres integration. |
+| `tests/` | 30 passing tests — unit + live-Postgres integration. |
 
 ---
 
 ## Operating the platform
 
 Per `README.md` "Setup" + "Run a campaign" sections. The submission-ready
-flow is one command:
+flow has two surfaces:
+
+**From the browser (preferred):**
+
+1. Open https://agentforge-adversarial-production.up.railway.app/
+2. Launch panel → choose **Live** → click **▶ Run campaign**
+3. Progress bar fills; heat-map auto-refreshes on completion.
+
+**From the CLI:**
 
 ```bash
-export COPILOT_SESSION_ID=<uuid-from-iframe>
+export COPILOT_PATIENT_ID=<synthea-patient-uuid>
 DATABASE_URL=<railway-url> make run-live
 # refresh https://agentforge-adversarial-production.up.railway.app/
 ```

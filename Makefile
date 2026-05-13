@@ -23,7 +23,7 @@ help:
 	@echo "  make test           Run the full test suite"
 	@echo "  make run            Run a campaign against MockCopilotClient"
 	@echo "  make run-mutate     Run + generate 3 LLM mutations per seed"
-	@echo "  make run-live       Run against the deployed Co-Pilot (needs COPILOT_SESSION_ID)"
+	@echo "  make run-live       Run against the deployed Co-Pilot (needs COPILOT_PATIENT_ID)"
 	@echo "  make dashboard      Launch Streamlit on http://localhost:8501"
 	@echo ""
 	@echo "  make health         Probe live target health"
@@ -54,11 +54,12 @@ run-mutate:
 	$(PY) -m agentforge_adversarial run --cases evals/cases --mutate
 
 run-live:
-	@if [ -z "$$COPILOT_SESSION_ID" ]; then \
-	  echo "ERROR: COPILOT_SESSION_ID is not set."; \
-	  echo "Obtain a session_id by opening the Co-Pilot iframe in OpenEMR and"; \
-	  echo "copying the value from the POST /v1/sessions response in devtools."; \
-	  echo "Then: export COPILOT_SESSION_ID=<uuid>"; \
+	@if [ -z "$$COPILOT_PATIENT_ID" ]; then \
+	  echo "ERROR: COPILOT_PATIENT_ID is not set."; \
+	  echo "The harness now auto-creates sessions; it just needs to know which"; \
+	  echo "Synthea patient to anchor the session to. Grab a patient UUID from"; \
+	  echo "the OpenEMR patient list (the 'pid' query param), then:"; \
+	  echo "  export COPILOT_PATIENT_ID=<uuid>"; \
 	  exit 1; \
 	fi
 	$(PY) -m agentforge_adversarial run --cases evals/cases --mutate --live

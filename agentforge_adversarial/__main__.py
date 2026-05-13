@@ -4,23 +4,25 @@ import argparse
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="AgentForge adversarial MVP")
+    parser = argparse.ArgumentParser(description="AgentForge adversarial CLI")
     sub = parser.add_subparsers(dest="cmd")
 
-    run_p = sub.add_parser("run", help="Run a campaign against the target")
+    run_p = sub.add_parser("run", help="Run a campaign against a target")
     run_p.add_argument("--cases", default="evals/cases")
     run_p.add_argument(
-        "--mutate",
+        "--no-mutate",
         action="store_true",
-        help="Also synthesize LLM-mutated variants of the first seed",
+        help="Disable the Red Team mutator (run only the hand-curated seeds).",
     )
     run_p.add_argument(
-        "--live",
-        action="store_true",
-        help="Hit the deployed Co-Pilot (requires OAuth). Default uses MockCopilotClient.",
+        "--target",
+        default=None,
+        help="Name of a target row from the `targets` table. "
+             "Defaults to the oldest row (typically the seeded Co-Pilot).",
     )
 
-    sub.add_parser("init-db", help="Apply migrations/001_initial.sql to Postgres")
+    sub.add_parser("init-db", help="Apply all SQL migrations in order")
+    sub.add_parser("list-targets", help="Print all configured targets")
     sub.add_parser("version", help="Print version and exit")
     return parser
 
@@ -45,6 +47,23 @@ def main() -> int:
         print("Schema applied.")
         return 0
 
+    if args.cmd == "list-targets":
+        import asyncio
+
+        from agentforge_adversarial.config import Config
+        from agentforge_adversarial.db import connection
+        from agentforge_adversarial.targets import list_targets
+
+        async def _go() -> None:
+            cfg = Config.from_env()
+            async with connection(cfg) as conn:
+                rows = await list_targets(conn)
+            for r in rows:
+                print(f"  {r['name']:40} {r['target_type']:15} {r['target_url']}")
+
+        asyncio.run(_go())
+        return 0
+
     if args.cmd == "run":
         import asyncio
         from pathlib import Path
@@ -56,8 +75,8 @@ def main() -> int:
             run_campaign(
                 Config.from_env(),
                 Path(args.cases),
-                mutate=args.mutate,
-                use_mock=not args.live,
+                mutate=not args.no_mutate,
+                target_name=args.target,
             )
         )
         print(f"\nCampaign {campaign_id} complete. Dashboard: streamlit run dashboard/app.py")

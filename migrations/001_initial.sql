@@ -5,7 +5,7 @@
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 -- §7 campaigns (declared before attack_queue per migration order).
-CREATE TABLE campaigns (
+CREATE TABLE IF NOT EXISTS campaigns (
   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name            TEXT NOT NULL,
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -14,10 +14,14 @@ CREATE TABLE campaigns (
 );
 
 -- §8 attack_queue
-CREATE TYPE attack_source AS ENUM ('direct', 'random', 'mutator', 'regression');
-CREATE TYPE queue_state   AS ENUM ('queued', 'dispatching', 'dispatched', 'failed', 'cancelled');
+DO $$ BEGIN
+  CREATE TYPE attack_source AS ENUM ('direct', 'random', 'mutator', 'regression', 'class_probe');
+EXCEPTION WHEN duplicate_object THEN null; END $$;
+DO $$ BEGIN
+  CREATE TYPE queue_state AS ENUM ('queued', 'dispatching', 'dispatched', 'failed', 'cancelled');
+EXCEPTION WHEN duplicate_object THEN null; END $$;
 
-CREATE TABLE attack_queue (
+CREATE TABLE IF NOT EXISTS attack_queue (
   id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   campaign_id            UUID NOT NULL REFERENCES campaigns(id),
   source                 attack_source NOT NULL,
@@ -36,14 +40,16 @@ CREATE TABLE attack_queue (
   failure_reason         TEXT
 );
 
-CREATE INDEX attack_queue_state_queued_idx
+CREATE INDEX IF NOT EXISTS attack_queue_state_queued_idx
   ON attack_queue (priority_score DESC, enqueued_at)
   WHERE state = 'queued';
 
 -- §1 attack_runs
-CREATE TYPE judge_verdict AS ENUM ('pass', 'partial', 'fail');
+DO $$ BEGIN
+  CREATE TYPE judge_verdict AS ENUM ('pass', 'partial', 'fail');
+EXCEPTION WHEN duplicate_object THEN null; END $$;
 
-CREATE TABLE attack_runs (
+CREATE TABLE IF NOT EXISTS attack_runs (
   id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   queue_entry_id         UUID UNIQUE NOT NULL,
   campaign_id            UUID NOT NULL REFERENCES campaigns(id),
@@ -78,7 +84,9 @@ CREATE TABLE attack_runs (
 );
 
 -- DEFERRABLE FK back to attack_queue (per database-schema.md §8).
-ALTER TABLE attack_runs
-  ADD CONSTRAINT attack_runs_queue_entry_fk
-  FOREIGN KEY (queue_entry_id) REFERENCES attack_queue(id)
-  DEFERRABLE INITIALLY DEFERRED;
+DO $$ BEGIN
+  ALTER TABLE attack_runs
+    ADD CONSTRAINT attack_runs_queue_entry_fk
+    FOREIGN KEY (queue_entry_id) REFERENCES attack_queue(id)
+    DEFERRABLE INITIALLY DEFERRED;
+EXCEPTION WHEN duplicate_object THEN null; END $$;

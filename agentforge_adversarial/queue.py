@@ -13,12 +13,18 @@ async def create_campaign(
     name: str,
     target_version: str,
     notes: str | None = None,
+    target_id: UUID | None = None,
 ) -> UUID:
     row = await conn.fetchrow(
-        "INSERT INTO campaigns (name, target_version, notes) VALUES ($1, $2, $3) RETURNING id",
+        """
+        INSERT INTO campaigns (name, target_version, notes, target_id)
+        VALUES ($1, $2, $3, $4)
+        RETURNING id
+        """,
         name,
         target_version,
         notes,
+        target_id,
     )
     return row["id"]
 

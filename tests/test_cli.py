@@ -12,4 +12,4 @@ def test_cli_help_runs():
         check=False,
     )
     assert result.returncode == 0
-    assert "AgentForge adversarial MVP" in result.stdout
+    assert "AgentForge adversarial CLI" in result.stdout

@@ -79,13 +79,14 @@ Postgres, surfaced on a Streamlit dashboard.
 | Ensemble Judge | ✅ keyword + LLM combined; agreement / disagreement recorded in `judge_reasoning` |
 | Red Team mutator subagent (gpt-4o-mini) | ✅ via `--mutate` — 3 variants per seed, `source='random'` |
 | Streamlit dashboard | ✅ KPIs + heat-map + filterable run table + drill-down |
-| Live Co-Pilot target | ✅ via `--live` + `COPILOT_SESSION_ID` (reuses an iframe-obtained session) |
+| Live Co-Pilot target | ✅ via `--live` + `COPILOT_PATIENT_ID` (harness auto-creates `/v1/sessions`) |
+| Operator console — Launch panel | ✅ Streamlit "▶ Run campaign" button, progress bar, auto-refresh while in-flight |
 | Mock target (`MockCopilotClient`) | ✅ default fallback; deliberate vulnerabilities for end-to-end testing without burning live sessions |
 
-**Headline deferred items:** LangGraph orchestration, in-dashboard Launch
-button (operator console), Documentation Agent, class-probe fan-out,
-regression harness, Langfuse traces. Detailed matrix and effort estimates
-in [`IMPLEMENTATION.md`](IMPLEMENTATION.md).
+**Headline deferred items:** LangGraph orchestration, Approve/Modify/Override
+gate + Vuln Board (rest of operator console), Documentation Agent,
+class-probe fan-out, regression harness, Langfuse traces. Detailed matrix
+and effort estimates in [`IMPLEMENTATION.md`](IMPLEMENTATION.md).
 
 ### Setup
 
@@ -107,23 +108,27 @@ make dashboard                          # http://localhost:8501
 
 ### Run a campaign — deployed Co-Pilot target
 
-The deployed Co-Pilot is gated by SMART OAuth + physician-panel checks. We
-reuse a session obtained from the OpenEMR iframe so the adversarial harness
-inherits valid auth without owning the OAuth dance.
+`POST /v1/sessions` on the Co-Pilot accepts a `(physician_user_id,
+patient_id)` pair and returns a session_id. The physician-panel gate lets
+`physician_user_id="admin"` through unconditionally. The harness creates
+its own sessions; you only have to tell it which Synthea patient to
+anchor them to.
 
-1. Open OpenEMR → patient chart → launch the Clinical Co-Pilot iframe.
-2. Browser devtools → Network → find the `POST /v1/sessions` response.
-3. Copy the `session_id` UUID from the response body.
-4. Export and run:
+1. Open OpenEMR → patient list (any patient) → copy the patient UUID
+   from the URL (the `pid` query param, e.g. `0fe1a5d2-...`).
+2. Configure once:
 
    ```bash
-   export COPILOT_SESSION_ID=<uuid-from-step-3>
-   make run-live
+   export COPILOT_PATIENT_ID=<uuid-from-step-1>
+   # Optional override; default is "admin":
+   # export COPILOT_PHYSICIAN_USER_ID=admin
    ```
 
-The same campaign runs end-to-end against the deployed Co-Pilot. Sessions
-are short-lived; if attacks start returning `[DISPATCH_ERROR]`, refresh
-the session and re-run.
+3. Click **▶ Run campaign** in the dashboard (Launch panel at the top),
+   or run `make run-live` from the CLI.
+
+Sessions are recreated automatically if they expire mid-campaign — the
+client retries once on a 404 from `/v1/chat` and continues.
 
 ### Inspect results
 
@@ -142,8 +147,9 @@ docker compose exec postgres psql -U agentforge -d agentforge -c \
 
 The dashboard is meant to be shareable so reviewers don't have to clone
 + `make up` to see results. Topology: Railway hosts managed Postgres +
-the Streamlit service; the CLI still runs from your laptop (it needs the
-short-lived `COPILOT_SESSION_ID` from the browser).
+the Streamlit service; the Launch panel inside the dashboard spawns
+campaigns as subprocesses of the Streamlit container itself — no
+laptop-side CLI is needed once `COPILOT_PATIENT_ID` is configured.
 
 1. **Create the Railway project**
    - railway.app → New Project → name it `agentforge-adversarial`.
@@ -151,18 +157,11 @@ short-lived `COPILOT_SESSION_ID` from the browser).
    - Copy `Postgres → Variables → DATABASE_URL` (the public/connect URL,
      not the internal one).
 
-2. **Migrate schema + populate from your laptop**
+2. **Apply schema** (one-time, from your laptop):
 
    ```bash
    export RAILWAY_DATABASE_URL='postgresql://...railway.app:.../railway?sslmode=require'
-
-   # Apply migrations to Railway Postgres
    DATABASE_URL="$RAILWAY_DATABASE_URL" .venv/bin/python -m agentforge_adversarial init-db
-
-   # Refresh COPILOT_SESSION_ID from the iframe devtools, then:
-   export COPILOT_SESSION_ID=<fresh-uuid>
-   DATABASE_URL="$RAILWAY_DATABASE_URL" .venv/bin/python \
-     -m agentforge_adversarial run --cases evals/cases --mutate --live
    ```
 
 3. **Deploy the Streamlit service**
@@ -171,12 +170,18 @@ short-lived `COPILOT_SESSION_ID` from the browser).
    - Variables on the new service:
      - `DATABASE_URL` = `${{Postgres.DATABASE_URL}}` (template ref auto-injects).
      - `TARGET_URL` = `https://copilot-production-b532.up.railway.app`.
+     - `COPILOT_PATIENT_ID` = a Synthea patient UUID from the OpenEMR
+       patient-list URL (the `pid` query param).
+     - `OPENAI_API_KEY` = your key (the in-container subprocess uses it
+       for the Red Team mutator and LLM Judge).
    - Railway picks up `railway.toml` (Nixpacks build, Streamlit start
      command, `/healthz` healthcheck).
    - Settings → Networking → **Generate Domain** for the public URL.
 
 4. **Verify**
-   - Open the public URL → KPIs + heat-map + drill-down all populated.
+   - Open the public URL → Launch panel renders at the top.
+   - Click **▶ Run campaign** (Live) → progress bar fills → heat-map +
+     KPIs populate.
    - Dashboard caption shows `DB: Railway` and the target URL.
 
 ### What's deferred from the full design
@@ -185,10 +190,11 @@ See **[`IMPLEMENTATION.md`](IMPLEMENTATION.md)** for the full status matrix
 (per-component MVP coverage, live verification results, prioritized gap to
 final submission with effort estimates).
 
-Short list of deferred items: LangGraph orchestration · in-dashboard
-Launch (operator console) · Orchestrator scoring · synthesize_fn pipeline ·
-class-probe · regression harness · Langfuse traces · pgvector novelty ·
-Documentation Agent. Refer to `ARCHITECTURE.md` for the full design intent.
+Short list of deferred items: LangGraph orchestration · operator console
+Approve/Modify/Override gate + Vuln Board · Orchestrator scoring ·
+synthesize_fn pipeline · class-probe · regression harness · Langfuse
+traces · pgvector novelty · Documentation Agent. Refer to `ARCHITECTURE.md`
+for the full design intent.
 
 ---
 

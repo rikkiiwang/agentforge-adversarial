@@ -25,6 +25,9 @@ async def connection(cfg: Config):
 
 
 async def init_schema(cfg: Config) -> None:
-    sql = Path("migrations/001_initial.sql").read_text()
+    migrations_dir = Path("migrations")
+    sql_files = sorted(migrations_dir.glob("*.sql"))
     async with connection(cfg) as conn:
-        await conn.execute(sql)
+        for sql_file in sql_files:
+            await conn.execute(sql_file.read_text())
+            print(f"applied {sql_file.name}")

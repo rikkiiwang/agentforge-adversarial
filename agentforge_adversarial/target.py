@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import time
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import UUID
 
 import asyncpg
@@ -16,45 +15,113 @@ class ChatClient(Protocol):
     async def chat(self, prompt: str) -> str: ...
 
 
+def make_client(target_row: dict[str, Any]) -> ChatClient:
+    """Factory: builds a ChatClient from a `targets` table row.
+
+    Dispatches by `target_type`. New target types added here as concrete
+    clients are written. The dashboard's Add-target form should constrain
+    target_type to the keys this factory knows about.
+    """
+    t = target_row["target_type"]
+    url = target_row["target_url"]
+    cfg = target_row.get("config_json") or {}
+
+    if t == "copilot":
+        return CopilotClient(
+            url,
+            patient_id=cfg.get("patient_id", ""),
+            physician_user_id=cfg.get("physician_user_id", "admin"),
+        )
+    if t == "generic_chat":
+        return GenericChatClient(
+            url,
+            request_template=cfg.get("request_template") or {"prompt": "{PROMPT}"},
+            response_path=cfg.get("response_path") or "response",
+            headers=cfg.get("headers") or {},
+        )
+    if t == "openai_compat":
+        return GenericChatClient(
+            url,
+            request_template=cfg.get("request_template") or {
+                "model": cfg.get("model", "gpt-4o-mini"),
+                "messages": [{"role": "user", "content": "{PROMPT}"}],
+            },
+            response_path=cfg.get("response_path")
+            or "choices.0.message.content",
+            headers={
+                "Authorization": f"Bearer {cfg['api_key']}",
+                **(cfg.get("headers") or {}),
+            } if cfg.get("api_key") else (cfg.get("headers") or {}),
+        )
+    raise ValueError(f"Unknown target_type: {t!r}")
+
+
 class CopilotClient:
-    """Hits the deployed Co-Pilot's `/v1/chat` using a pre-obtained `session_id`.
+    """Hits the deployed Co-Pilot's `/v1/chat`, auto-creating sessions as needed.
 
-    The Co-Pilot is gated by SMART OAuth: `/v1/sessions` requires a valid OpenEMR
-    physician + patient_id, which is only available from a browser launched out
-    of OpenEMR (or a working `SMART_DEV_CREDENTIALS` env on Railway). We bypass
-    that bootstrap by *reusing* a session_id obtained from the iframe — once a
-    session exists, `/v1/chat {session_id, question}` works for any caller.
-
-    Get a session_id:
-      1. Open OpenEMR → patient chart → launch the Co-Pilot iframe.
-      2. Devtools → Network → find the POST /v1/sessions response.
-      3. Copy `session_id` and `export COPILOT_SESSION_ID=<uuid>`.
-
-    The session is short-lived; refresh by repeating those steps.
+    `POST /v1/sessions` has no OAuth bearer requirement — the gate is the
+    physician-panel check, which `physician_user_id="admin"` bypasses
+    unconditionally when admin has no Practitioner UUID. So the harness can
+    create its own session by POSTing `(patient_id, physician_user_id)` and
+    cache the returned session_id for the campaign duration. On 404 (session
+    expired mid-campaign), recreate once and retry the chat call.
     """
 
     def __init__(
         self,
         target_url: str,
-        session_id: str | None = None,
+        *,
+        patient_id: str,
+        physician_user_id: str = "admin",
         timeout_seconds: float = 60.0,
     ):
-        self.target_url = target_url.rstrip("/")
-        self.session_id = session_id or os.environ.get("COPILOT_SESSION_ID", "").strip()
-        if not self.session_id:
+        if not patient_id:
             raise RuntimeError(
-                "CopilotClient needs a session_id. Open the Co-Pilot iframe in "
-                "OpenEMR, copy session_id from the /v1/sessions response, then "
-                "set COPILOT_SESSION_ID=<uuid> in your environment."
+                "CopilotClient needs patient_id (a Synthea patient UUID). "
+                "Set COPILOT_PATIENT_ID in your environment — see README "
+                "§Run a campaign for how to obtain one."
             )
+        self.target_url = target_url.rstrip("/")
+        self.patient_id = patient_id
+        self.physician_user_id = physician_user_id
         self.timeout_seconds = timeout_seconds
+        self._session_id: str | None = None
+        self._transport: httpx.AsyncBaseTransport | None = None
+
+    def _client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            timeout=self.timeout_seconds, transport=self._transport
+        )
+
+    async def _ensure_session(self) -> str:
+        if self._session_id:
+            return self._session_id
+        async with self._client() as client:
+            r = await client.post(
+                f"{self.target_url}/v1/sessions",
+                json={
+                    "patient_id": self.patient_id,
+                    "physician_user_id": self.physician_user_id,
+                },
+            )
+            r.raise_for_status()
+            self._session_id = r.json()["session_id"]
+        return self._session_id
 
     async def chat(self, prompt: str) -> str:
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+        session_id = await self._ensure_session()
+        async with self._client() as client:
             r = await client.post(
                 f"{self.target_url}/v1/chat",
-                json={"session_id": self.session_id, "question": prompt},
+                json={"session_id": session_id, "question": prompt},
             )
+            if r.status_code == 404:
+                self._session_id = None
+                session_id = await self._ensure_session()
+                r = await client.post(
+                    f"{self.target_url}/v1/chat",
+                    json={"session_id": session_id, "question": prompt},
+                )
             r.raise_for_status()
             data = r.json()
         if isinstance(data, dict):
@@ -67,6 +134,78 @@ class CopilotClient:
                 or data
             )
         return str(data)
+
+
+class GenericChatClient:
+    """Attacks any HTTP/JSON LLM endpoint that takes a prompt and returns text.
+
+    Configured per-target via `targets.config_json`:
+      - `request_template`: dict with `{PROMPT}` placeholder(s) somewhere inside.
+        e.g. for OpenAI Chat Completions:
+          {"model": "gpt-4o-mini",
+           "messages": [{"role": "user", "content": "{PROMPT}"}]}
+        e.g. for a generic /chat endpoint:
+          {"prompt": "{PROMPT}"}
+      - `response_path`: dot-separated path to the text in the JSON response.
+        Supports list indices, e.g. "choices.0.message.content".
+      - `headers`: extra HTTP headers (Authorization, etc.).
+
+    No session model — every chat() call is stateless. If the target needs
+    a session (like CopilotClient), implement a dedicated subclass.
+    """
+
+    def __init__(
+        self,
+        target_url: str,
+        *,
+        request_template: dict[str, Any],
+        response_path: str = "response",
+        headers: dict[str, str] | None = None,
+        timeout_seconds: float = 60.0,
+    ):
+        self.target_url = target_url.rstrip("/")
+        self.request_template = request_template
+        self.response_path = response_path
+        self.headers = headers or {}
+        self.timeout_seconds = timeout_seconds
+        self._transport: httpx.AsyncBaseTransport | None = None
+
+    def _client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            timeout=self.timeout_seconds, transport=self._transport
+        )
+
+    @staticmethod
+    def _substitute(body: Any, prompt: str) -> Any:
+        if isinstance(body, str):
+            return body.replace("{PROMPT}", prompt)
+        if isinstance(body, dict):
+            return {k: GenericChatClient._substitute(v, prompt) for k, v in body.items()}
+        if isinstance(body, list):
+            return [GenericChatClient._substitute(v, prompt) for v in body]
+        return body
+
+    @staticmethod
+    def _extract(payload: Any, path: str) -> str:
+        cur: Any = payload
+        for segment in path.split("."):
+            if isinstance(cur, list) and segment.isdigit():
+                cur = cur[int(segment)]
+            elif isinstance(cur, dict):
+                cur = cur.get(segment)
+            else:
+                cur = None
+            if cur is None:
+                return str(payload)
+        return str(cur)
+
+    async def chat(self, prompt: str) -> str:
+        body = self._substitute(self.request_template, prompt)
+        async with self._client() as client:
+            r = await client.post(self.target_url, json=body, headers=self.headers)
+            r.raise_for_status()
+            data = r.json()
+        return self._extract(data, self.response_path)
 
 
 class MockCopilotClient:

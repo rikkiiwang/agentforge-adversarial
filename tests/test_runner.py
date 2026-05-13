@@ -24,7 +24,6 @@ class _FakeClient:
 async def test_runner_writes_one_attack_run_per_seed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    monkeypatch.setattr(runner_mod, "CopilotClient", _FakeClient)
     monkeypatch.setenv("OPENAI_API_KEY", "")
 
     (tmp_path / "case.yaml").write_text(
@@ -42,7 +41,7 @@ async def test_runner_writes_one_attack_run_per_seed(
 
     cfg = Config.from_env()
     campaign_id = await runner_mod.run_campaign(
-        cfg, tmp_path, mutate=False, use_mock=False
+        cfg, tmp_path, mutate=False, chat_client=_FakeClient()
     )
     assert campaign_id is not None
 
