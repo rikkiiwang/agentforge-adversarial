@@ -66,7 +66,7 @@ dashboard reads from Postgres for the demo view.
 |---|---|
 | Postgres `campaigns` / `attack_queue` / `attack_runs` | ✅ (subset of `docs/components/database-schema.md`) |
 | Dispatcher INSERTs / Judge UPDATEs with atomic CHECK | ✅ |
-| Keyword Judge for 3 categories | ✅ |
+| Keyword Judge for 8 of 9 designed categories | ✅ Prompt Injection · Data Exfiltration · Tool Misuse · State Corruption · Identity & Role · DoS & Cost · Observability Leak ⭐ · Verification-Gate Bypass ⭐. Deferred: Multimodal & Document Poisoning (needs `/v1/documents/attach` channel, not `/v1/chat`). |
 | LLM Judge (gpt-4o-mini, prompt_injection only) + ensemble | ✅ (active when `OPENAI_API_KEY` is set) |
 | Red Team mutator subagent (gpt-4o-mini) | ✅ (`--mutate` flag) |
 | Streamlit dashboard | ✅ |
