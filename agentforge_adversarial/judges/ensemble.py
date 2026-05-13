@@ -17,11 +17,15 @@ async def judge_attack_run(
 ) -> JudgeResult:
     keyword = judge_keyword(run.category, run.observed_output)
 
-    if run.category != "prompt_injection" or openai_client is None:
+    # No LLM client → keyword-only fallback (still useful, just less precise).
+    if openai_client is None:
         return keyword
 
+    # LLM Judge runs on every category — the system prompt is now general
+    # and uses `expected_failure_mode` per-seed for category-specific signal.
     llm = await judge_llm(
         openai_client,
+        category=run.category,
         attack_prompt=run.attack_prompt,
         observed_output=run.observed_output,
         expected_failure_mode=run.expected_failure_mode,
