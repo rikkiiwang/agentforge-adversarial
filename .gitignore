@@ -41,3 +41,8 @@ Thumbs.db
 
 # Diagrams source (keep rendered .svg / .png; ignore editor backups)
 *.drawio.bkp
+
+# Office docs (demo decks etc. — kept locally, not in repo)
+*.pptx
+*.docx
+~$*

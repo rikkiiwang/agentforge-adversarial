@@ -19,12 +19,15 @@ would.
 | `ARCHITECTURE.md` | Multi-agent platform design — 4 agents, LangGraph state machine, Postgres persistence, dashboards. **Hard-gate deliverable.** |
 | `THREAT_MODEL.md` | Structured attack-surface taxonomy — 9 categories, OWASP / MITRE ATLAS cross-references. **Hard-gate deliverable.** |
 | `USERS.md` | Target user of *this* platform (security engineer / red-team operator) and the workflows it supports. |
+| `IMPLEMENTATION.md` | Implementation status as of submission — per-component MVP coverage matrix, live verification results, prioritized gap to final submission. |
+| `agentforge_adversarial/` | MVP source — runner, queue, target client, Judge ensemble, Red Team mutator. |
+| `dashboard/` | Streamlit dashboard reading from Postgres `attack_runs`. |
+| `evals/cases/` | 8 seed YAML test cases (one per shipped category). |
+| `migrations/` | Postgres schema (subset of the canonical design in `docs/components/database-schema.md`). |
+| `tests/` | 28 passing tests (unit + live-Postgres integration). |
 | `docs/agents/` | Per-agent detailed design (Orchestrator, Red Team swarm, Judge, Documentation). |
 | `docs/components/` | Detailed design for non-agent components (synthesis pipeline, queues, regression harness, schema, dashboard, observability). |
 | `docs/taxonomy/` | One file per attack category — quality bars, channels, defenses tested, seed attack examples. |
-
-Source code, evals, and infrastructure will land here as the implementation
-proceeds (`src/`, `evals/`, `infra/`).
 
 ---
 
@@ -33,8 +36,9 @@ proceeds (`src/`, `evals/`, `infra/`).
 | | This repo | Co-Pilot repo |
 |---|---|---|
 | Role | Attacker | Target |
-| Language | Python (FastAPI + LangGraph) | PHP (OpenEMR) + Python (`copilot/`) |
-| Communication | HTTPS to Co-Pilot's chat + FHIR endpoints | n/a |
+| Language (designed) | Python (LangGraph + FastAPI control plane) | PHP (OpenEMR) + Python (`copilot/`) |
+| Language (MVP) | Python (plain async `runner.py` + Streamlit dashboard) — LangGraph deferred, see [`IMPLEMENTATION.md`](IMPLEMENTATION.md) | same |
+| Communication | HTTPS `POST /v1/chat` reusing a session_id from the Co-Pilot iframe | n/a |
 | Data shared | Test results, vuln reports, regression schedule | Live patient context (Synthea synthetic data only) |
 
 The Week 3 PRD calls for a fork of OpenEMR. We are interpreting that loosely:
@@ -47,31 +51,41 @@ is a separate repo. The README of each links to the other.
 
 | Stage | State |
 |---|---|
-| Architecture defense | Draft in `ARCHITECTURE.md` |
-| Threat model | Draft in `THREAT_MODEL.md` |
-| Per-block design docs | In `docs/agents/` + `docs/components/` |
-| MVP implementation | Shipped (2026-05-12) — see below |
+| Architecture design | `ARCHITECTURE.md` |
+| Threat model | `THREAT_MODEL.md` (9 categories) |
+| Per-block design docs | `docs/agents/` + `docs/components/` |
+| MVP implementation | **Shipped 2026-05-12** — full status matrix + gap-to-final in [`IMPLEMENTATION.md`](IMPLEMENTATION.md) |
+| Deployed dashboard | https://agentforge-adversarial-production.up.railway.app/ |
 
 ---
 
 ## MVP run (2026-05-12)
 
-Thin vertical slice of the platform: seed attacks across three categories,
-hit a target, ensemble Judge writes verdicts to Postgres, Streamlit
-dashboard reads from Postgres for the demo view.
+Vertical slice of the platform: 8 of 9 designed attack categories,
+5-seed-per-category × 3-LLM-mutations = 32 attacks per `--mutate` campaign,
+dispatched against the deployed Clinical Co-Pilot, verdicts written by an
+**ensemble Judge (keyword + gpt-4o-mini LLM, every category)** to
+Postgres, surfaced on a Streamlit dashboard.
 
 ### What's in the MVP
 
 | Component | MVP coverage |
 |---|---|
-| Postgres `campaigns` / `attack_queue` / `attack_runs` | ✅ (subset of `docs/components/database-schema.md`) |
-| Dispatcher INSERTs / Judge UPDATEs with atomic CHECK | ✅ |
-| Keyword Judge for 8 of 9 designed categories | ✅ Prompt Injection · Data Exfiltration · Tool Misuse · State Corruption · Identity & Role · DoS & Cost · Observability Leak ⭐ · Verification-Gate Bypass ⭐. Deferred: Multimodal & Document Poisoning (needs `/v1/documents/attach` channel, not `/v1/chat`). |
-| LLM Judge (gpt-4o-mini, prompt_injection only) + ensemble | ✅ (active when `OPENAI_API_KEY` is set) |
-| Red Team mutator subagent (gpt-4o-mini) | ✅ (`--mutate` flag) |
-| Streamlit dashboard | ✅ |
-| Live Co-Pilot target | ✅ via `--live` + `COPILOT_SESSION_ID`. Reuses a session obtained from the OpenEMR iframe (see "Run against the live target" below). |
-| Mock target (`MockCopilotClient`) | ✅ default fallback. Mimics the API shape with deliberately seeded vulnerabilities so the platform is demoable without burning live sessions. |
+| Postgres `campaigns` / `attack_queue` / `attack_runs` | ✅ subset of `docs/components/database-schema.md` (3 of 9 designed tables); atomic CHECK + DEFERRABLE FK enforced |
+| Dispatcher INSERTs / Judge UPDATEs with atomic CHECK | ✅ two-phase write enforced by `attack_runs_judge_atomic` |
+| Attack-category coverage | ✅ **8 of 9** — Prompt Injection · Data Exfiltration · Tool Misuse · State Corruption · Identity & Role · DoS & Cost · Observability Leak ⭐ · Verification-Gate Bypass ⭐. Deferred: Multimodal & Document Poisoning (needs `/v1/documents/attach` channel, not `/v1/chat`) |
+| Keyword Judge | ✅ category-specific marker sets + DoS length predicate (response > 2000 chars) |
+| LLM Judge (gpt-4o-mini) | ✅ runs on **every** category; SYSTEM_PROMPT is category-general and uses each seed's `expected_failure_mode` as the per-category rubric anchor |
+| Ensemble Judge | ✅ keyword + LLM combined; agreement / disagreement recorded in `judge_reasoning` |
+| Red Team mutator subagent (gpt-4o-mini) | ✅ via `--mutate` — 3 variants per seed, `source='random'` |
+| Streamlit dashboard | ✅ KPIs + heat-map + filterable run table + drill-down |
+| Live Co-Pilot target | ✅ via `--live` + `COPILOT_SESSION_ID` (reuses an iframe-obtained session) |
+| Mock target (`MockCopilotClient`) | ✅ default fallback; deliberate vulnerabilities for end-to-end testing without burning live sessions |
+
+**Headline deferred items:** LangGraph orchestration, in-dashboard Launch
+button (operator console), Documentation Agent, class-probe fan-out,
+regression harness, Langfuse traces. Detailed matrix and effort estimates
+in [`IMPLEMENTATION.md`](IMPLEMENTATION.md).
 
 ### Setup
 
@@ -167,9 +181,14 @@ short-lived `COPILOT_SESSION_ID` from the browser).
 
 ### What's deferred from the full design
 
-LangGraph orchestration · Orchestrator scoring · synthesize_fn pipeline ·
-class-probe · regression harness · Langfuse · pgvector novelty · Ollama
-swarm · Documentation Agent. See `ARCHITECTURE.md` for the full picture.
+See **[`IMPLEMENTATION.md`](IMPLEMENTATION.md)** for the full status matrix
+(per-component MVP coverage, live verification results, prioritized gap to
+final submission with effort estimates).
+
+Short list of deferred items: LangGraph orchestration · in-dashboard
+Launch (operator console) · Orchestrator scoring · synthesize_fn pipeline ·
+class-probe · regression harness · Langfuse traces · pgvector novelty ·
+Documentation Agent. Refer to `ARCHITECTURE.md` for the full design intent.
 
 ---
 
