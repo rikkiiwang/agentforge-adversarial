@@ -36,6 +36,8 @@ async def enqueue_cases(
     *,
     red_team_subagent_id: str = "direct-seed",
     red_team_model: str = "n/a",
+    parent_id: UUID | None = None,
+    round_num: int = 0,
 ) -> list[QueueEntry]:
     out: list[QueueEntry] = []
     for case in cases:
@@ -50,14 +52,16 @@ async def enqueue_cases(
             expected_failure_mode=case.expected_failure_mode,
             red_team_subagent_id=red_team_subagent_id,
             red_team_model=red_team_model,
+            parent_id=parent_id,
+            round_num=round_num,
         )
         await conn.execute(
             """
             INSERT INTO attack_queue (
               id, campaign_id, source, category, subcategory, channel,
               attack_prompt, red_team_subagent_id, red_team_model,
-              expected_failure_mode, priority_score
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+              expected_failure_mode, priority_score, parent_id, round_num
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
             """,
             entry.id,
             entry.campaign_id,
@@ -70,6 +74,8 @@ async def enqueue_cases(
             entry.red_team_model,
             entry.expected_failure_mode,
             entry.priority_score,
+            entry.parent_id,
+            entry.round_num,
         )
         out.append(entry)
     return out

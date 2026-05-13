@@ -1,7 +1,7 @@
 # AgentForge Adversarial — Implementation Status
 
-**Submission date:** 2026-05-12 (MVP) · revised 2026-05-12 (operator console partial + auto-auth)
-**MVP commit:** `513ee25` (initial MVP); operator-console Launch panel + auto-auth added in a follow-up commit on the same day.
+**Submission date:** 2026-05-12 (MVP) · revised 2026-05-13 (operator console + auto-auth + multi-target + LangGraph + class-probe)
+**MVP commit:** `513ee25` (initial MVP). Subsequent work on 2026-05-12/13 added: operator-console Launch panel, auto-session-creation auth, multi-target generic factory, LangGraph state machine, and class-probe FAIL fan-out.
 **Deployed dashboard:** https://agentforge-adversarial-production.up.railway.app/
 **Target under test:** https://copilot-production-b532.up.railway.app/
 
@@ -9,20 +9,23 @@
 
 ## TL;DR
 
-A vertical slice of the platform shipped: **8 of 9 designed attack categories**,
-**5 hand-curated seed cases per category amplified to 32 attacks via an LLM
-Red Team mutator**, dispatched against the deployed Clinical Co-Pilot,
+A vertical slice of the platform: **8 of 9 designed attack categories**,
+**8 hand-curated seed cases amplified to 32 attacks via an LLM Red Team
+mutator + class-probe fan-out on FAIL (10 boundary variants per failing
+attack, bounded by max_rounds)**, dispatched against any registered AI
+target via a `targets` table (Co-Pilot, generic_chat, or openai_compat),
 verdicts written by an **ensemble Judge (deterministic keyword + gpt-4o-mini
-LLM)** to **Railway-hosted Postgres**, surfaced on a public **Streamlit
-dashboard**. All control flow runs as plain async Python in
-`agentforge_adversarial/runner.py` — LangGraph orchestration is the headline
-deferred item.
+LLM)** to **Railway-hosted Postgres**, surfaced on a **Streamlit dashboard**
+with an in-browser Launch panel + Add-target form. Control flow runs as a
+**LangGraph 5-node state machine** in `agentforge_adversarial/graph.py`,
+with a conditional edge `judge → class_probe → dispatch` that loops on FAIL
+until `max_rounds` is exhausted.
 
 | Submission gate | Status |
 |---|---|
 | Hard gate: 3+ attack categories | ✅ 8 categories shipped |
-| Hard gate: agent prototype running live against deployed target | ✅ Red Team mutator + Ensemble Judge, hits live Co-Pilot |
-| Hard gate: working test suite | ✅ 30 tests pass (`make test`) |
+| Hard gate: agent prototype running live against deployed target | ✅ Red Team mutator + Class-Probe subagent + Ensemble Judge, hits live Co-Pilot OR any registered target |
+| Hard gate: working test suite | ✅ 41 tests pass (`make test`) |
 | Hard gate: results visible to reviewer | ✅ public dashboard reads from Railway Postgres |
 
 ---
@@ -35,7 +38,7 @@ Mapped to the section numbers in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 | Agent | MVP | Notes |
 |---|---|---|
-| **Red Team Swarm** | ⚠️ Partial | 1 subagent × gpt-4o-mini, hard-coded. Produces 3 mutations per seed via `agentforge_adversarial/red_team/mutator.py`. **Missing for final:** configurable swarm from `config/swarm.yaml`, multi-LLM (claude-haiku, deepseek, llama-3 via Ollama), parallel synthesis with `synthesize_fn` (designed in `docs/components/synthesis-pipeline.md`). |
+| **Red Team Swarm** | ⚠️ Partial | 2 subagents × gpt-4o-mini, hard-coded models: `red-team-mutator-0` (3 mutations per seed in the mutate node) + `red-team-class-probe-0` (10 boundary variants per FAIL in the class-probe node). **Missing for final:** configurable swarm from `config/swarm.yaml`, multi-LLM (claude-haiku, deepseek, llama-3 via Ollama), parallel synthesis with `synthesize_fn` (designed in `docs/components/synthesis-pipeline.md`). |
 | **Judge** | ✅ Shipped | Ensemble: keyword predicates + gpt-4o-mini LLM on every category. Files: `agentforge_adversarial/judges/{keyword,llm_judge,ensemble}.py`. Atomic UPDATE enforced by `attack_runs_judge_atomic` CHECK constraint. |
 | **Orchestrator** | ❌ Deferred | Designed in `docs/agents/orchestrator.md` (5-signal weighted scoring, per-category daily pools, score-weighted budget, `SwarmRecommendation`). MVP runner.py uses fixed config + flat seeds + uniform mutator instead. |
 | **Documentation Agent** | ❌ Deferred | Designed in `docs/agents/documentation-agent.md` (severity logic, class-probe two-write flow, parent_vuln_id variant linking, defense-mapped suggested fix). MVP writes verdicts directly to `attack_runs` from the Judge; no `vuln_reports` rows generated yet. |
@@ -47,7 +50,7 @@ Mapped to the section numbers in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 | **Attack Queue** | ⚠️ Partial | `attack_queue` table shipped with all designed columns + per-source provenance rules. Dispatch loop is a single sequential for-loop in `runner.py` (not the async `dispatcher_loop` with rate/cost filters from `docs/components/attack-queue.md` §4). |
 | **Dispatcher → Judge two-phase write** | ✅ Shipped | Dispatcher INSERTs `attack_runs` with Judge cols NULL; Judge UPDATEs atomically (`attack_runs_judge_atomic` CHECK). Idempotency via `attack_runs.queue_entry_id UNIQUE` + DEFERRABLE FK. |
 | **Synthesis pipeline** | ❌ Deferred | Designed in `docs/components/synthesis-pipeline.md` (6-stage: normalize → embed → dedup → novelty → score → budget-cap). MVP enqueues all mutator outputs directly. |
-| **Class-probe** | ❌ Deferred | FAIL → ~10 boundary variants fan-out. Needs LangGraph conditional edges. |
+| **Class-probe** | ✅ Shipped 2026-05-13 | FAIL → 10 boundary variants fan-out. Implemented as `class_probe_node` in `graph.py` + `red_team/class_probe.py` (gpt-4o-mini with a boundary-axis system prompt). Lineage stored in `attack_runs.parent_id` (migration 003). Bounded by `--max-rounds` (default 2). |
 | **Regression Harness** | ❌ Deferred | Designed in `docs/components/regression-harness.md`. Needs a scheduler; current model is one-shot CLI campaigns. |
 | **Dashboard** | ✅ Shipped | Streamlit single-page: KPI cards, altair category × verdict heat-map, filterable run table, per-run drill-down. File: `dashboard/app.py`. Deployed on Railway via `railway.toml` (Nixpacks build, `/healthz` healthcheck). |
 | **Observability** | ⚠️ Partial | Stdout logging from `runner.py` only. **Missing for final:** Langfuse traces (one trace per campaign with generation spans), per-attack `langfuse_trace_id` column populated. |
@@ -59,7 +62,8 @@ Mapped to the section numbers in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 | Item | MVP | Notes |
 |---|---|---|
-| **LangGraph state machine** | ❌ Deferred | Plain async Python in `runner.py:run_campaign()` (50 lines, sequential). State-machine invariants enforced at the DB level (`attack_runs_judge_atomic` CHECK + `queue_entry_id UNIQUE`) so future LangGraph state schemas migrate cleanly. **Final:** LangGraph unlocks conditional edges (`PARTIAL → Mutator re-entry`, `FAIL → fan-out to Documentation Agent + Class-Probe + Regression`) which is where the framework's value lands. |
+| **LangGraph state machine** | ✅ Shipped 2026-05-13 | 5-node graph in `agentforge_adversarial/graph.py`: `load_seeds → mutate → dispatch → judge → (decide) → END or class_probe → dispatch`. `CampaignState` TypedDict carries pending QueueEntries, dispatched runs, FAIL count, and round number. Conditional edge `decide_after_judge` routes to `class_probe` on FAIL && `round_num < max_rounds`, else END. `runner.py` is now a thin wrapper that resolves the target, builds the chat client, and invokes the compiled graph. **Still deferred:** PARTIAL → Mutator re-entry edge (the FAIL path landed first because it's higher-signal for the demo). |
+| **Class-probe fan-out** | ✅ Shipped 2026-05-13 | `agentforge_adversarial/red_team/class_probe.py` — on FAIL, gpt-4o-mini generates up to 10 boundary variants per failing attack (different phrasing / framing / authority axes). Variants enqueued with `source='class_probe'`, `parent_id` = the failing run's id, `round_num` one greater than the parent's. Lineage tracked in `attack_runs.parent_id` (migration `003_lineage.sql`). `max_rounds` bounds the loop (default 2, CLI `--max-rounds N`). |
 
 ### Attack categories (`THREAT_MODEL.md` §1-§9)
 
@@ -109,15 +113,17 @@ they exist.
 Prioritized by demo-credibility-per-hour, with effort estimates. Final
 submission should aim for everything in P0 + P1; P2 is bonus.
 
-### P0 — LangGraph + remaining operator-console gates
+### P0 — remaining operator-console gates
 
 | Item | Effort | What it unlocks |
 |---|---|---|
-| LangGraph node/edge skeleton wrapping the existing `runner.py` flow | 3-4 h | Foundation for the rest of P0. Same behavior, graph-shaped. |
+| ~~LangGraph node/edge skeleton~~ | ✅ ~~3-4 h~~ Shipped 2026-05-13 | 5-node graph in `agentforge_adversarial/graph.py`. |
 | ~~In-dashboard Launch button + live progress~~ | ✅ ~~6-7 h~~ Shipped 2026-05-12 | Streamlit Launch panel + subprocess launcher + 5s meta-refresh while in-flight. |
+| ~~Multi-target picker + add-target form~~ | ✅ ~~3 h~~ Shipped 2026-05-13 | Platform attacks any AI system via the `targets` table (copilot, generic_chat, openai_compat). |
+| ~~Conditional edge: FAIL → Class-probe fan-out (10 boundary variants)~~ | ✅ ~~4 h~~ Shipped 2026-05-13 | LangGraph's `decide_after_judge` routes to `class_probe_node` on FAIL && round_num < max_rounds. |
 | Swarm-config picker on Launch panel (model + variant count + budget) per `docs/components/dashboard.md §4.1` | 1.5 h | Operator can override defaults per campaign without editing YAML. |
 | Approve/Modify/Override gate UI (when `swarm_approval_mode != 'auto'`) | 2 h | Per `docs/components/dashboard.md §4.1`. The full §4.1 trust contract. |
-| Conditional edges: `PARTIAL → Mutator re-entry`, `FAIL → Class-probe fan-out (10 boundary variants)` | 4 h | Where LangGraph actually earns its keep. Produces the variant-chain effect described in `ARCHITECTURE.md §4`. |
+| Conditional edge: `PARTIAL → Mutator re-entry` | 2 h | Mirror of the FAIL→class-probe edge for ambiguous verdicts. |
 
 ### P1 — Documentation Agent + vuln lifecycle
 
@@ -152,7 +158,10 @@ submission should aim for everything in P0 + P1; P2 is bonus.
 
 | Path | Purpose |
 |---|---|
-| `agentforge_adversarial/runner.py` | Sequential async pipeline (load → mutate → enqueue → dispatch → judge → write) — replaces the LangGraph state machine in MVP. |
+| `agentforge_adversarial/runner.py` | Thin wrapper that resolves the target, builds the chat client, and invokes the compiled LangGraph state machine. |
+| `agentforge_adversarial/graph.py` | LangGraph `CampaignState` + 5 nodes (load_seeds, mutate, dispatch, judge, class_probe) + `decide_after_judge` conditional edge. |
+| `agentforge_adversarial/red_team/class_probe.py` | Class-probe subagent (10 boundary variants per FAIL via gpt-4o-mini). |
+| `agentforge_adversarial/targets.py` | CRUD helpers over the `targets` table (list, get-by-name, default, add). |
 | `agentforge_adversarial/queue.py` | `create_campaign`, `enqueue_cases` (writes to `attack_queue`). |
 | `agentforge_adversarial/target.py` | `CopilotClient` (session-reuse against live target), `MockCopilotClient` (vulnerable test double), `dispatch_to_attack_run`, `insert_attack_run`. |
 | `agentforge_adversarial/judges/keyword.py` | Deterministic Judge — 8 category-specific marker sets + length predicate for DC. |

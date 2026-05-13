@@ -359,6 +359,8 @@ async def dispatch_to_attack_run(
         observed_output=observed,
         target_version=target_version,
         latency_ms=latency_ms,
+        parent_id=entry.parent_id,
+        round_num=entry.round_num,
     )
 
 
@@ -369,9 +371,10 @@ async def insert_attack_run(conn: asyncpg.Connection, run: AttackRun) -> UUID:
         INSERT INTO attack_runs (
           id, queue_entry_id, campaign_id, case_id, source, category, subcategory, channel,
           red_team_subagent_id, red_team_model, attack_prompt, expected_failure_mode,
-          observed_output, target_version, cost_usd, latency_ms, dispatcher_version
+          observed_output, target_version, cost_usd, latency_ms, dispatcher_version,
+          parent_id, round_num
         ) VALUES (
-          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19
         ) RETURNING id
         """,
         run.id,
@@ -391,6 +394,8 @@ async def insert_attack_run(conn: asyncpg.Connection, run: AttackRun) -> UUID:
         run.cost_usd,
         run.latency_ms,
         run.dispatcher_version,
+        run.parent_id,
+        run.round_num,
     )
     await conn.execute(
         "UPDATE attack_queue SET state='dispatched', dispatched_at=now(), attack_run_id=$1 WHERE id=$2",

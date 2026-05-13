@@ -20,6 +20,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Name of a target row from the `targets` table. "
              "Defaults to the oldest row (typically the seeded Co-Pilot).",
     )
+    run_p.add_argument(
+        "--max-rounds",
+        type=int,
+        default=2,
+        help="Max class-probe rounds after the initial dispatch. "
+             "0 disables fan-out. Default 2.",
+    )
 
     sub.add_parser("init-db", help="Apply all SQL migrations in order")
     sub.add_parser("list-targets", help="Print all configured targets")
@@ -77,6 +84,7 @@ def main() -> int:
                 Path(args.cases),
                 mutate=not args.no_mutate,
                 target_name=args.target,
+                max_rounds=args.max_rounds,
             )
         )
         print(f"\nCampaign {campaign_id} complete. Dashboard: streamlit run dashboard/app.py")

@@ -7,7 +7,7 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, Field
 
 Verdict = Literal["pass", "partial", "fail"]
-Source = Literal["direct", "random", "mutator", "regression"]
+Source = Literal["direct", "random", "mutator", "regression", "class_probe"]
 Severity = Literal["low", "medium", "high", "critical"]
 
 
@@ -38,6 +38,8 @@ class QueueEntry(BaseModel):
     red_team_model: str
     priority_score: float = 0.5
     enqueued_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    parent_id: UUID | None = None
+    round_num: int = 0
 
 
 class AttackRun(BaseModel):
@@ -58,6 +60,8 @@ class AttackRun(BaseModel):
     cost_usd: float = 0.0
     latency_ms: int
     dispatcher_version: str = "0.1.0"
+    parent_id: UUID | None = None
+    round_num: int = 0
     judge_verdict: Verdict | None = None
     judge_reasoning: str | None = None
     judge_rubric_version: str | None = None

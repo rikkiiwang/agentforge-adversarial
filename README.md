@@ -36,8 +36,7 @@ would.
 | | This repo | Co-Pilot repo |
 |---|---|---|
 | Role | Attacker | Target |
-| Language (designed) | Python (LangGraph + FastAPI control plane) | PHP (OpenEMR) + Python (`copilot/`) |
-| Language (MVP) | Python (plain async `runner.py` + Streamlit dashboard) — LangGraph deferred, see [`IMPLEMENTATION.md`](IMPLEMENTATION.md) | same |
+| Language | Python (LangGraph state machine in `agentforge_adversarial/graph.py` + Streamlit dashboard) | PHP (OpenEMR) + Python (`copilot/`) |
 | Communication | HTTPS `POST /v1/chat` reusing a session_id from the Co-Pilot iframe | n/a |
 | Data shared | Test results, vuln reports, regression schedule | Live patient context (Synthea synthetic data only) |
 
@@ -77,16 +76,16 @@ Postgres, surfaced on a Streamlit dashboard.
 | Keyword Judge | ✅ category-specific marker sets + DoS length predicate (response > 2000 chars) |
 | LLM Judge (gpt-4o-mini) | ✅ runs on **every** category; SYSTEM_PROMPT is category-general and uses each seed's `expected_failure_mode` as the per-category rubric anchor |
 | Ensemble Judge | ✅ keyword + LLM combined; agreement / disagreement recorded in `judge_reasoning` |
-| Red Team mutator subagent (gpt-4o-mini) | ✅ via `--mutate` — 3 variants per seed, `source='random'` |
-| Streamlit dashboard | ✅ KPIs + heat-map + filterable run table + drill-down |
-| Live Co-Pilot target | ✅ via `--live` + `COPILOT_PATIENT_ID` (harness auto-creates `/v1/sessions`) |
-| Operator console — Launch panel | ✅ Streamlit "▶ Run campaign" button, progress bar, auto-refresh while in-flight |
-| Mock target (`MockCopilotClient`) | ✅ default fallback; deliberate vulnerabilities for end-to-end testing without burning live sessions |
+| Red Team mutator subagent (gpt-4o-mini) | ✅ 3 mutations per seed, `source='random'` |
+| Red Team class-probe subagent (gpt-4o-mini) | ✅ 10 boundary variants per FAIL, `source='class_probe'`, parent lineage via `attack_runs.parent_id` |
+| LangGraph state machine | ✅ 5 nodes (load_seeds → mutate → dispatch → judge → class_probe) + conditional edge `judge → class_probe → dispatch` on FAIL, bounded by `--max-rounds` |
+| Multi-target via `targets` table | ✅ 3 target types: `copilot` (auto-creates `/v1/sessions`), `generic_chat` (any HTTP/JSON LLM with a prompt template), `openai_compat` (OpenAI Chat Completions wire format) |
+| Streamlit dashboard | ✅ KPIs + heat-map + filterable run table + drill-down + ▶ Run campaign button + ➕ Add target form |
 
-**Headline deferred items:** LangGraph orchestration, Approve/Modify/Override
-gate + Vuln Board (rest of operator console), Documentation Agent,
-class-probe fan-out, regression harness, Langfuse traces. Detailed matrix
-and effort estimates in [`IMPLEMENTATION.md`](IMPLEMENTATION.md).
+**Headline deferred items:** Approve/Modify/Override gate + Vuln Board
+(rest of operator console), Documentation Agent, regression harness,
+Langfuse traces, PARTIAL→mutator re-entry edge, configurable swarm.
+Detailed matrix and effort estimates in [`IMPLEMENTATION.md`](IMPLEMENTATION.md).
 
 ### Setup
 
@@ -190,11 +189,11 @@ See **[`IMPLEMENTATION.md`](IMPLEMENTATION.md)** for the full status matrix
 (per-component MVP coverage, live verification results, prioritized gap to
 final submission with effort estimates).
 
-Short list of deferred items: LangGraph orchestration · operator console
-Approve/Modify/Override gate + Vuln Board · Orchestrator scoring ·
-synthesize_fn pipeline · class-probe · regression harness · Langfuse
-traces · pgvector novelty · Documentation Agent. Refer to `ARCHITECTURE.md`
-for the full design intent.
+Short list of deferred items: operator-console Approve/Modify/Override
+gate + Vuln Board · Orchestrator scoring · synthesize_fn pipeline ·
+regression harness · Langfuse traces · pgvector novelty · Documentation
+Agent · PARTIAL→mutator re-entry edge. Refer to `ARCHITECTURE.md` for
+the full design intent.
 
 ---
 
