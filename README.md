@@ -81,11 +81,13 @@ Postgres, surfaced on a Streamlit dashboard.
 | Red Team partial-reentry subagent (gpt-4o-mini) | ✅ 3 fresh phrasings per PARTIAL to disambiguate ambiguous verdicts, parent lineage via `attack_runs.parent_id` |
 | LangGraph state machine | ✅ 7 nodes (load_seeds → mutate → dispatch → judge → partial_reentry / class_probe / bump_round → dispatch). Two conditional edges: `decide_after_judge` (PARTIAL/FAIL/END) + `decide_after_partial_reentry` (class_probe/bump_round). Bounded by `--max-rounds`. |
 | Multi-target via `targets` table | ✅ 3 target types: `copilot` (auto-creates `/v1/sessions`), `generic_chat` (any HTTP/JSON LLM with a prompt template), `openai_compat` (OpenAI Chat Completions wire format) |
-| Streamlit dashboard | ✅ KPIs + heat-map + filterable run table + drill-down + Campaign selector + ▶ Run + ➕ Add target + ⏹ Cancel + swarm-config picker + Approve/Modify/Override gate + phase-aware progress fragment |
+| Streamlit dashboard | ✅ KPIs + heat-map + filterable run table + drill-down + Campaign selector + ▶ Run + ➕ Add target + ⏹ Cancel + swarm-config picker + Approve/Modify/Override gate + phase-aware progress fragment + 🛡️ Vulnerability Board |
+| Documentation Agent | ✅ writes `vulnerabilities` + `vuln_reports` rows on every FAIL; severity weighted by clinical-safety impact; lineage via `attack_runs.parent_id` |
+| Seed corpus | ✅ **32 seeds** (8 hand-curated + 15 Garak + 5 JailbreakBench + 4 HouYi) across 8 categories |
 
-**Headline deferred items:** Vuln Board (P1), Documentation Agent (P1),
-regression harness (P2), Langfuse traces (P2), Multimodal & Document
-Poisoning category (P2), pgvector novelty dedup (not planned). All P0
+**Headline deferred items:** regression harness (P2), Langfuse traces (P2),
+Multimodal & Document Poisoning category (P2), pgvector novelty dedup
+(not planned), history-aware mutator/class-probe prompts (P2). All P0 + P1
 items shipped 2026-05-13. Detailed matrix in [`IMPLEMENTATION.md`](IMPLEMENTATION.md).
 
 ### Setup
@@ -190,9 +192,9 @@ See **[`IMPLEMENTATION.md`](IMPLEMENTATION.md)** for the full status matrix
 (per-component MVP coverage, live verification results, prioritized gap to
 final submission with effort estimates).
 
-Short list of deferred items: Vuln Board · Orchestrator scoring ·
-synthesize_fn pipeline · regression harness · Langfuse traces · pgvector
-novelty · Documentation Agent · Multimodal/document-poisoning channel.
+Short list of deferred items: Orchestrator scoring · synthesize_fn pipeline ·
+regression harness · Langfuse traces · pgvector novelty · Multimodal /
+document-poisoning channel · history-aware mutator + class-probe prompts.
 Refer to `ARCHITECTURE.md` for the full design intent.
 
 ---
