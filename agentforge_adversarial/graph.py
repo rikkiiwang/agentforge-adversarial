@@ -69,6 +69,25 @@ def _accumulate(left: list, right: list) -> list:
     return (left or []) + (right or [])
 
 
+def _build_history(completed: list[AttackRun] | None) -> list[dict[str, str]]:
+    """Project completed AttackRuns into the lightweight dict shape the
+    mutator + class-probe history hint expects. Only judged runs with a
+    verdict contribute — in-flight or judge-failed runs are skipped."""
+    if not completed:
+        return []
+    out: list[dict[str, str]] = []
+    for r in completed:
+        v = getattr(r, "judge_verdict", None)
+        if v not in ("pass", "fail", "partial"):
+            continue
+        out.append({
+            "category": r.category,
+            "verdict": v,
+            "attack_prompt": r.attack_prompt,
+        })
+    return out
+
+
 class CampaignState(TypedDict, total=False):
     # Inputs (set by runner.py before graph.invoke).
     cfg: Config
@@ -240,15 +259,19 @@ async def class_probe_node(state: CampaignState) -> dict[str, Any]:
     if openai_client is None or not fails:
         print(f"[graph:class_probe] no fan-out (no FAILs or no LLM); ending round {next_round}")
         return {"round_num": next_round, "fails_this_round": []}
+    history = _build_history(state.get("completed"))
     print(
         f"[graph:class_probe] round {next_round}: generating variants for "
-        f"{len(fails)} FAILs in parallel (concurrency={LLM_CONCURRENCY})"
+        f"{len(fails)} FAILs in parallel (concurrency={LLM_CONCURRENCY}, "
+        f"history_hint={len(history)} prior runs)"
     )
     sem = asyncio.Semaphore(LLM_CONCURRENCY)
 
     async def _probe_one(failing_run):
         async with sem:
-            return failing_run, await generate_boundary_variants(openai_client, failing_run)
+            return failing_run, await generate_boundary_variants(
+                openai_client, failing_run, history=history
+            )
 
     results = await asyncio.gather(
         *(_probe_one(f) for f in fails), return_exceptions=True
@@ -303,9 +326,11 @@ async def partial_reentry_node(state: CampaignState) -> dict[str, Any]:
             f"round stays {round_num}"
         )
         return {"partials_this_round": []}
+    history = _build_history(state.get("completed"))
     print(
         f"[graph:partial_reentry] round {next_round}: re-mutating "
-        f"{len(partials)} PARTIALs in parallel (concurrency={LLM_CONCURRENCY})"
+        f"{len(partials)} PARTIALs in parallel (concurrency={LLM_CONCURRENCY}, "
+        f"history_hint={len(history)} prior runs)"
     )
     sem = asyncio.Semaphore(LLM_CONCURRENCY)
     seed_cases = load_cases(state["cases_path"])
@@ -335,7 +360,9 @@ async def partial_reentry_node(state: CampaignState) -> dict[str, Any]:
             )
         async with sem:
             return partial_run, await mutate_case(
-                openai_client, seed, n=int(state.get("mutations_per_seed", 3))
+                openai_client, seed,
+                n=int(state.get("mutations_per_seed", 3)),
+                history=history,
             )
 
     results = await asyncio.gather(
