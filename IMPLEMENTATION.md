@@ -7,6 +7,42 @@
 
 ---
 
+## Scope honesty
+
+This codebase is an **architecture-aligned vertical slice** of
+`ARCHITECTURE.md`, not the full multi-agent platform that document
+describes. What ships:
+
+- LangGraph 7-node state machine + FAIL/PARTIAL fan-out
+- Postgres `campaigns` / `attack_queue` / `attack_runs` two-phase write
+  with atomic CHECK constraint
+- Ensemble Judge (keyword + LLM, every category)
+- Documentation Agent + vulnerability lifecycle (`discovered → triaged
+  → fix_proposed → fix_validated / reopened / closed`)
+- Multi-target factory (`copilot` / `generic_chat` / `openai_compat`)
+- Per-campaign cost rollup (P2)
+- Slim regression harness (CLI + Vuln Board button)
+- History-aware mutator + class-probe prompts (rounds 1+)
+
+What is **not** in this slice — final-work scope:
+
+- Orchestrator per-cell scoring engine (`docs/components/orchestrator-scoring.md`)
+- `synthesize_fn` pipeline that promotes high-novelty FAILs into seed cases
+- `regression_schedule` table + cron / per-deploy triggers (the shipped
+  regression harness is operator-initiated, not autonomous)
+- Langfuse trace integration (needs external account; designed in
+  `docs/components/observability.md`)
+- Multimodal & Document Poisoning category (needs target-side
+  `/v1/documents/attach`)
+- pgvector novelty dedup (not planned until seed corpus > 50)
+
+The shipped surface is enough to demonstrate the contract end-to-end
+(seed → mutator → dispatch → Judge → vuln → triage → replay) on a real
+deployed target. The deferred surface is what would turn it from a
+slice into an always-on platform.
+
+---
+
 ## TL;DR
 
 A vertical slice of the platform: **8 of 9 designed attack categories**,

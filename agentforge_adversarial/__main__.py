@@ -39,6 +39,21 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("list-targets", help="Print all configured targets")
     sub.add_parser("version", help="Print version and exit")
 
+    update_p = sub.add_parser(
+        "update-target",
+        help="Patch a target's config_json (e.g. set patient_id on the seeded "
+             "Co-Pilot row without having to round-trip through the dashboard).",
+    )
+    update_p.add_argument("--name", required=True, help="Target name.")
+    update_p.add_argument(
+        "--patient-id",
+        help="Synthea patient UUID (writes config_json.patient_id).",
+    )
+    update_p.add_argument(
+        "--physician-user-id",
+        help="Override config_json.physician_user_id (default: admin).",
+    )
+
     regress_p = sub.add_parser(
         "regress",
         help="Replay confirmed vulnerabilities against the current target "
@@ -81,6 +96,41 @@ def main() -> int:
 
         asyncio.run(init_schema(Config.from_env()))
         print("Schema applied.")
+        return 0
+
+    if args.cmd == "update-target":
+        import asyncio
+        import json as _json
+
+        from agentforge_adversarial.config import Config
+        from agentforge_adversarial.db import connection
+        from agentforge_adversarial.targets import get_target_by_name
+
+        async def _go() -> None:
+            cfg = Config.from_env()
+            patch: dict[str, str] = {}
+            if args.patient_id:
+                patch["patient_id"] = args.patient_id
+            if args.physician_user_id:
+                patch["physician_user_id"] = args.physician_user_id
+            if not patch:
+                print("Nothing to patch — pass --patient-id or "
+                      "--physician-user-id.")
+                return
+            async with connection(cfg) as conn:
+                row = await get_target_by_name(conn, args.name)
+                if row is None:
+                    print(f"No target named {args.name!r}.")
+                    return
+                merged = dict(row.get("config_json") or {})
+                merged.update(patch)
+                await conn.execute(
+                    "UPDATE targets SET config_json = $1::jsonb WHERE id = $2",
+                    _json.dumps(merged), row["id"],
+                )
+                print(f"Updated {args.name!r}. New config_json: {merged}")
+
+        asyncio.run(_go())
         return 0
 
     if args.cmd == "list-targets":

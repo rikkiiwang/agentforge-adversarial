@@ -10,7 +10,7 @@ ST     := .venv/bin/streamlit
 
 PYTHON311 := /opt/homebrew/bin/python3.11
 
-.PHONY: help venv install init-db test run run-mutate run-live dashboard clean-db logs ps health
+.PHONY: help venv install init-db test run run-no-mutate run-live dashboard clean-db logs ps health
 
 help:
 	@echo "AgentForge Adversarial — make targets"
@@ -22,7 +22,7 @@ help:
 	@echo ""
 	@echo "  make test           Run the full test suite"
 	@echo "  make run            Run a campaign against MockCopilotClient"
-	@echo "  make run-mutate     Run + generate 3 LLM mutations per seed"
+	@echo "  make run-no-mutate  Run seeds only (mutator off; mutator is on by default)"
 	@echo "  make run-live       Run against the deployed Co-Pilot (needs COPILOT_PATIENT_ID)"
 	@echo "  make dashboard      Launch Streamlit on http://localhost:8501"
 	@echo ""
@@ -50,19 +50,25 @@ test:
 run:
 	$(PY) -m agentforge_adversarial run --cases evals/cases
 
-run-mutate:
-	$(PY) -m agentforge_adversarial run --cases evals/cases --mutate
+# Seeds-only (mutator off). Mutator is on by default — use --no-mutate to
+# disable it. Live vs mock is now chosen by the `targets` table row.
+run-no-mutate:
+	$(PY) -m agentforge_adversarial run --cases evals/cases --no-mutate
 
+# Live = the seeded deployed Co-Pilot target. Requires COPILOT_PATIENT_ID
+# (a Synthea UUID) — make_client() reads it as a fallback when the target
+# row's config_json.patient_id is empty.
 run-live:
 	@if [ -z "$$COPILOT_PATIENT_ID" ]; then \
 	  echo "ERROR: COPILOT_PATIENT_ID is not set."; \
-	  echo "The harness now auto-creates sessions; it just needs to know which"; \
-	  echo "Synthea patient to anchor the session to. Grab a patient UUID from"; \
-	  echo "the OpenEMR patient list (the 'pid' query param), then:"; \
+	  echo "The harness auto-creates sessions; it just needs to know which"; \
+	  echo "Synthea patient to anchor the session to. Grab a patient UUID"; \
+	  echo "from the OpenEMR patient list (the 'pid' query param), then:"; \
 	  echo "  export COPILOT_PATIENT_ID=<uuid>"; \
 	  exit 1; \
 	fi
-	$(PY) -m agentforge_adversarial run --cases evals/cases --mutate --live
+	$(PY) -m agentforge_adversarial run --cases evals/cases \
+	  --target "OpenEMR Clinical Co-Pilot (deployed)"
 
 dashboard:
 	$(ST) run dashboard/app.py

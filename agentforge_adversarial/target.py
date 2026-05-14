@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from typing import Any, Protocol
 from uuid import UUID
@@ -21,6 +22,16 @@ def make_client(target_row: dict[str, Any]) -> ChatClient:
     Dispatches by `target_type`. New target types added here as concrete
     clients are written. The dashboard's Add-target form should constrain
     target_type to the keys this factory knows about.
+
+    Copilot env-var fallback: the seeded target row stores patient_id as
+    an empty string by design (`migrations/002_targets.sql` — every
+    operator's Synthea UUID is different, so we can't bake one in). When
+    `config_json.patient_id` is empty, fall back to `$COPILOT_PATIENT_ID`
+    so the README/Makefile `export COPILOT_PATIENT_ID=...; make run-live`
+    workflow actually reaches the client. Same for `physician_user_id`
+    via `$COPILOT_PHYSICIAN_USER_ID`. A non-empty value in `config_json`
+    (i.e. set explicitly via the dashboard's Add-target form) always
+    wins over the env.
     """
     t = target_row["target_type"]
     url = target_row["target_url"]
@@ -29,8 +40,14 @@ def make_client(target_row: dict[str, Any]) -> ChatClient:
     if t == "copilot":
         return CopilotClient(
             url,
-            patient_id=cfg.get("patient_id", ""),
-            physician_user_id=cfg.get("physician_user_id", "admin"),
+            patient_id=(
+                cfg.get("patient_id")
+                or os.environ.get("COPILOT_PATIENT_ID", "")
+            ),
+            physician_user_id=(
+                cfg.get("physician_user_id")
+                or os.environ.get("COPILOT_PHYSICIAN_USER_ID", "admin")
+            ),
         )
     if t == "generic_chat":
         return GenericChatClient(

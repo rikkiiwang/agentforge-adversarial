@@ -23,6 +23,41 @@ def test_make_client_copilot():
     assert client.physician_user_id == "admin"
 
 
+def test_make_client_copilot_env_fallback_when_config_empty(monkeypatch):
+    """The seeded target row stores patient_id="" by design; the
+    `make run-live` workflow exports COPILOT_PATIENT_ID. The factory
+    must pick that up so CLI live runs don't require a dashboard
+    round-trip to populate config_json."""
+    monkeypatch.setenv("COPILOT_PATIENT_ID", "env-pid-9")
+    monkeypatch.setenv("COPILOT_PHYSICIAN_USER_ID", "env-physician")
+    client = make_client(
+        {
+            "target_type": "copilot",
+            "target_url": "https://example.invalid",
+            "config_json": {"patient_id": "", "physician_user_id": ""},
+        }
+    )
+    assert isinstance(client, CopilotClient)
+    assert client.patient_id == "env-pid-9"
+    assert client.physician_user_id == "env-physician"
+
+
+def test_make_client_copilot_config_wins_over_env(monkeypatch):
+    """A non-empty config_json.patient_id (set explicitly via the
+    dashboard's Add-target form) must override the env var — otherwise
+    operators with multiple Co-Pilot targets get cross-contamination."""
+    monkeypatch.setenv("COPILOT_PATIENT_ID", "env-pid-9")
+    client = make_client(
+        {
+            "target_type": "copilot",
+            "target_url": "https://example.invalid",
+            "config_json": {"patient_id": "config-pid-1",
+                            "physician_user_id": "admin"},
+        }
+    )
+    assert client.patient_id == "config-pid-1"
+
+
 def test_make_client_generic_chat_defaults():
     client = make_client(
         {

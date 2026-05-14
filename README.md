@@ -60,11 +60,22 @@ is a separate repo. The README of each links to the other.
 
 ## MVP run (2026-05-12)
 
+> **Scope honesty:** this is an **architecture-aligned vertical slice**
+> of `ARCHITECTURE.md`, not the full multi-agent platform. The
+> load-bearing pieces are shipped — LangGraph state machine, Postgres
+> queue/run two-phase write, ensemble Judge, Documentation Agent, vuln
+> lifecycle, multi-target factory, cost rollup, FAIL/PARTIAL fan-out —
+> but the **full Orchestrator scoring engine, synthesize_fn pipeline,
+> `regression_schedule` cron, and Langfuse tracing remain as final
+> work** beyond this submission. See `IMPLEMENTATION.md` for the
+> per-component matrix; section §"P2 deferred" lists what's not in.
+
 Vertical slice of the platform: 8 of 9 designed attack categories,
-5-seed-per-category × 3-LLM-mutations = 32 attacks per `--mutate` campaign,
-dispatched against the deployed Clinical Co-Pilot, verdicts written by an
-**ensemble Judge (keyword + gpt-4o-mini LLM, every category)** to
-Postgres, surfaced on a Streamlit dashboard.
+**32 seeds × ~3-LLM-mutations** per default campaign, dispatched
+against any registered target (mock, deployed Co-Pilot, generic_chat,
+openai_compat), verdicts written by an **ensemble Judge (keyword +
+gpt-4o-mini LLM, every category)** to Postgres, surfaced on a
+Streamlit dashboard.
 
 ### What's in the MVP
 
@@ -108,8 +119,8 @@ make init-db                            # apply migrations/001_initial.sql
 ### Run a campaign — mock target (default)
 
 ```bash
-make run                                # 5 seeds against MockCopilotClient
-make run-mutate                         # 5 seeds + 15 LLM-mutated variants
+make run                                # 32 seeds + 3 mutations each (mutator is on by default)
+make run-no-mutate                      # 32 seeds only (mutator off)
 make dashboard                          # http://localhost:8501
 ```
 
@@ -131,8 +142,18 @@ anchor them to.
    # export COPILOT_PHYSICIAN_USER_ID=admin
    ```
 
-3. Click **▶ Run campaign** in the dashboard (Launch panel at the top),
-   or run `make run-live` from the CLI.
+3. Click **▶ Run campaign** in the dashboard's 🚀 Launch tab, or run
+   `make run-live` from the CLI. `make_client()` will pick up
+   `$COPILOT_PATIENT_ID` as a fallback when the target row's
+   `config_json.patient_id` is empty (which is how the seeded row ships).
+
+To make the patient_id durable instead of relying on the env var:
+
+```bash
+.venv/bin/python -m agentforge_adversarial update-target \
+  --name "OpenEMR Clinical Co-Pilot (deployed)" \
+  --patient-id <uuid-from-step-1>
+```
 
 Sessions are recreated automatically if they expire mid-campaign — the
 client retries once on a 404 from `/v1/chat` and continues.
