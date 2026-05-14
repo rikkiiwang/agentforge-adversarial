@@ -558,6 +558,115 @@ with tab_vulns:
                         "FAIL from the regression harness."
                     )
 
+                # --- Regression replay (P2) ---
+                # Dispatches the *original* attack_prompt against the current
+                # target. PASS → fix_validated. FAIL → reopened. PARTIAL →
+                # no state change. See `agentforge_adversarial/regression.py`.
+                st.divider()
+                st.markdown("**Regression replay**")
+                replay_help = (
+                    "Replay this vulnerability's original attack against the "
+                    "current target version. Use this after deploying a "
+                    "candidate fix. The Judge's verdict drives state "
+                    "transitions (PASS → fix_validated, FAIL → reopened, "
+                    "PARTIAL → no change)."
+                )
+                if cur_state == "discovered":
+                    st.caption(
+                        "🔁 Replay disabled while state=discovered. "
+                        "Triage first."
+                    )
+                else:
+                    if st.button(
+                        "🔁 Replay against current target",
+                        key=f"replay_{chosen_vuln}",
+                        help=replay_help,
+                    ):
+                        import asyncio as _asyncio
+
+                        from agentforge_adversarial.config import Config
+                        from agentforge_adversarial.db import connection
+                        from agentforge_adversarial.regression import (
+                            replay_vulnerability,
+                        )
+                        from agentforge_adversarial.target import make_client
+                        from agentforge_adversarial.targets import (
+                            get_default_target,
+                            get_target_by_name,
+                        )
+
+                        async def _replay_one() -> dict:
+                            cfg = Config.from_env()
+                            from openai import AsyncOpenAI
+                            oc = (
+                                AsyncOpenAI(api_key=cfg.openai_api_key)
+                                if cfg.openai_api_key else None
+                            )
+                            async with connection(cfg) as _conn:
+                                # Reload vuln + attack_run from DB to get
+                                # canonical attack_prompt (the dashboard df
+                                # may be stale).
+                                row = await _conn.fetchrow(
+                                    """
+                                    SELECT v.id AS vuln_id,
+                                           v.attack_run_id, v.state::text AS state,
+                                           v.category, v.subcategory,
+                                           v.target_version AS original_target_version,
+                                           ar.case_id, ar.attack_prompt,
+                                           ar.expected_failure_mode
+                                      FROM vulnerabilities v
+                                      JOIN attack_runs ar ON ar.id = v.attack_run_id
+                                     WHERE v.id = $1
+                                    """,
+                                    UUID(chosen_vuln),
+                                )
+                                if row is None:
+                                    return {"error": "vuln not found"}
+                                # Default target = whatever's in the targets table.
+                                target_row = await get_default_target(_conn)
+                            if target_row is None:
+                                return {"error": "no default target"}
+                            chat_client = make_client(target_row)
+                            new_target_version = (
+                                f"{target_row['target_type']}:"
+                                f"{target_row['target_url']}"
+                            )
+                            async with connection(cfg) as _conn:
+                                res = await replay_vulnerability(
+                                    _conn, dict(row),
+                                    chat_client=chat_client,
+                                    openai_client=oc,
+                                    new_target_version=new_target_version,
+                                )
+                            return {
+                                "verdict": res.new_verdict,
+                                "state": res.new_state,
+                                "observed": res.observed_output_truncated,
+                                "new_target_version": new_target_version,
+                            }
+
+                        with st.spinner("Dispatching replay against current target…"):
+                            outcome = _asyncio.run(_replay_one())
+                        if "error" in outcome:
+                            st.error(f"Replay failed: {outcome['error']}")
+                        else:
+                            verdict_color = {
+                                "pass": "🟢", "fail": "🔴", "partial": "🟡",
+                            }.get(outcome["verdict"], "⚪")
+                            st.success(
+                                f"Replay verdict: {verdict_color} "
+                                f"**{outcome['verdict'].upper()}** → "
+                                f"new state: `{outcome['state']}`"
+                            )
+                            st.caption(
+                                f"target: `{outcome['new_target_version']}`"
+                            )
+                            with st.expander("Observed output (truncated)"):
+                                st.code(outcome["observed"], language="text")
+                            st.cache_data.clear()
+                            # Don't auto-rerun — let the operator read the
+                            # verdict first, then refresh to see the new state.
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # Tab 3 — Attack runs (filters + table + drill-down)
