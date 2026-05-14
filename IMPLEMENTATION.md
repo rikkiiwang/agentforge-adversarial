@@ -1,6 +1,6 @@
 # AgentForge Adversarial — Implementation Status
 
-**Submission date:** 2026-05-12 (MVP) · revised 2026-05-13 (operator console complete + auto-auth + multi-target + LangGraph + FAIL/PARTIAL fan-out + swarm picker + Approve gate + parallel LLM)
+**Submission date:** 2026-05-12 (MVP) · revised 2026-05-13 (operator console complete + auto-auth + multi-target + LangGraph + FAIL/PARTIAL fan-out + swarm picker + Approve gate + parallel LLM) · 2026-05-14 (P2: dashboard tabs refactor + cost rollup + regression harness + history-aware prompts)
 **MVP commit:** `513ee25` (initial MVP). Subsequent work on 2026-05-12/13 added: operator-console Launch panel, auto-session-creation auth, multi-target generic factory, LangGraph state machine, and class-probe FAIL fan-out.
 **Deployed dashboard:** https://agentforge-adversarial-production.up.railway.app/
 **Target under test:** https://copilot-production-b532.up.railway.app/
@@ -147,10 +147,11 @@ submission should aim for everything in P0 + P1; P2 is bonus.
 
 | Item | Effort | What it unlocks |
 |---|---|---|
-| Langfuse integration (`langfuse_trace_id` per campaign, generation spans per attack) | 3 h | Designed in `docs/components/observability.md`. Gives reviewers a trace per attack. |
-| `cost_rollup_daily` materialized view + dashboard cost panel | 1 h | Per `database-schema.md` §10. |
-| Regression Harness — `target_version` change detection + replay queue | 3 h | Per `docs/components/regression-harness.md`. Needs cron or webhook trigger. |
-| Multimodal & Document Poisoning (MP) — 9th attack category via `/v1/documents/attach` | 4 h | Per `THREAT_MODEL.md` §8. Closes the 9/9 coverage gap. |
+| Langfuse integration (`langfuse_trace_id` per campaign, generation spans per attack) | 3 h | Designed in `docs/components/observability.md`. Gives reviewers a trace per attack. **Status: deferred** — requires an external Langfuse account; out of scope for tonight's submission. |
+| ~~Per-campaign LLM cost rollup~~ | ✅ ~~1.5 h~~ | Shipped 2026-05-14 as migration `005_cost_rollup.sql` + `agentforge_adversarial/cost.py` + sidebar "Red-team LLM cost" tile. ContextVar threads `campaign_id` through `asyncio.gather`; per-1M-token USD price table (2026-05 snapshot) for gpt-4o, gpt-4o-mini, gpt-4.1-mini. Cost is harness-side only — target's own LLM bill is not visible through a black-box chat interface. |
+| ~~Regression Harness — slim version~~ | ✅ ~~2 h~~ | Shipped 2026-05-14 as `agentforge_adversarial/regression.py` + CLI `python -m agentforge_adversarial regress` + Vuln-Board "🔁 Replay" button. Replay verdict → state map: PASS → `fix_validated`, FAIL → `reopened`, PARTIAL → no change. Replays use the same ensemble Judge as the live graph. **Deferred from slim:** `regression_schedule` table + cron triggers + `attack_queue` `source='regression'` enqueue. |
+| ~~History-aware mutator + class-probe prompts (D)~~ | ✅ ~~1.5 h~~ | Shipped 2026-05-14 as `red_team/mutator.py:_format_history_hint()`. In rounds 1+, the LLM sees a same-category-filtered list of REFUSED (= PASS) and SUCCEEDED (= FAIL) prompts. Biases variants away from already-defended framings. |
+| Multimodal & Document Poisoning (MP) — 9th attack category via `/v1/documents/attach` | 4 h | Per `THREAT_MODEL.md` §8. **Status: deferred** — requires target-side `/v1/documents/attach` endpoint + multipart dispatcher. Out of scope for tonight; 8/9 categories shipped is the demo claim. |
 
 ### Not planned for final
 

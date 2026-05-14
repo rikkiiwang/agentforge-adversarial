@@ -81,14 +81,19 @@ Postgres, surfaced on a Streamlit dashboard.
 | Red Team partial-reentry subagent (gpt-4o-mini) | ✅ 3 fresh phrasings per PARTIAL to disambiguate ambiguous verdicts, parent lineage via `attack_runs.parent_id` |
 | LangGraph state machine | ✅ 7 nodes (load_seeds → mutate → dispatch → judge → partial_reentry / class_probe / bump_round → dispatch). Two conditional edges: `decide_after_judge` (PARTIAL/FAIL/END) + `decide_after_partial_reentry` (class_probe/bump_round). Bounded by `--max-rounds`. |
 | Multi-target via `targets` table | ✅ 3 target types: `copilot` (auto-creates `/v1/sessions`), `generic_chat` (any HTTP/JSON LLM with a prompt template), `openai_compat` (OpenAI Chat Completions wire format) |
-| Streamlit dashboard | ✅ KPIs + heat-map + filterable run table + drill-down + Campaign selector + ▶ Run + ➕ Add target + ⏹ Cancel + swarm-config picker + Approve/Modify/Override gate + phase-aware progress fragment + 🛡️ Vulnerability Board |
+| Streamlit dashboard | ✅ 4-tab layout (📊 Coverage / 🛡️ Vulns / 🎯 Runs / 🚀 Launch) with persistent sidebar carrying campaign scope, live KPIs (Total / FAIL / PARTIAL / PASS), red-team LLM cost tile, and active-campaign progress fragment |
 | Documentation Agent | ✅ writes `vulnerabilities` + `vuln_reports` rows on every FAIL; severity weighted by clinical-safety impact; lineage via `attack_runs.parent_id` |
 | Seed corpus | ✅ **32 seeds** (8 hand-curated + 15 Garak + 5 JailbreakBench + 4 HouYi) across 8 categories |
+| Cost rollup | ✅ ContextVar threads `campaign_id` through `asyncio.gather`; per-1M-token price table (2026-05 snapshot) for gpt-4o / gpt-4o-mini / gpt-4.1-mini; sidebar cost tile + token caption |
+| Regression harness | ✅ `python -m agentforge_adversarial regress` CLI + Vuln-Board "🔁 Replay" button; PASS → fix_validated, FAIL → reopened, PARTIAL → no change |
+| History-aware Red Team prompts | ✅ rounds 1+ feed REFUSED/SUCCEEDED same-category context into mutator + class-probe LLM prompts to bias away from already-defended framings |
 
-**Headline deferred items:** regression harness (P2), Langfuse traces (P2),
-Multimodal & Document Poisoning category (P2), pgvector novelty dedup
-(not planned), history-aware mutator/class-probe prompts (P2). All P0 + P1
-items shipped 2026-05-13. Detailed matrix in [`IMPLEMENTATION.md`](IMPLEMENTATION.md).
+**Headline deferred items:** Langfuse traces (P2 — needs external account),
+Multimodal & Document Poisoning category (P2 — needs target-side
+`/v1/documents/attach`), pgvector novelty dedup (not planned),
+`regression_schedule` table + cron (slim regression-harness shipped instead).
+P0 + P1 shipped 2026-05-13; P2 shipped 2026-05-14. Detailed matrix in
+[`IMPLEMENTATION.md`](IMPLEMENTATION.md).
 
 ### Setup
 
@@ -193,8 +198,9 @@ See **[`IMPLEMENTATION.md`](IMPLEMENTATION.md)** for the full status matrix
 final submission with effort estimates).
 
 Short list of deferred items: Orchestrator scoring · synthesize_fn pipeline ·
-regression harness · Langfuse traces · pgvector novelty · Multimodal /
-document-poisoning channel · history-aware mutator + class-probe prompts.
+Langfuse traces (needs external account) · pgvector novelty · Multimodal /
+document-poisoning channel (needs target-side endpoint) ·
+`regression_schedule` table + cron (slim CLI + button shipped instead).
 Refer to `ARCHITECTURE.md` for the full design intent.
 
 ---
