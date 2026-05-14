@@ -92,9 +92,15 @@ def main() -> int:
         import asyncio
 
         from agentforge_adversarial.config import Config
-        from agentforge_adversarial.db import init_schema
+        from agentforge_adversarial.db import close_pool, init_schema
 
-        asyncio.run(init_schema(Config.from_env()))
+        async def _go() -> None:
+            try:
+                await init_schema(Config.from_env())
+            finally:
+                await close_pool()
+
+        asyncio.run(_go())
         print("Schema applied.")
         return 0
 
@@ -103,7 +109,7 @@ def main() -> int:
         import json as _json
 
         from agentforge_adversarial.config import Config
-        from agentforge_adversarial.db import connection
+        from agentforge_adversarial.db import close_pool, connection
         from agentforge_adversarial.targets import get_target_by_name
 
         async def _go() -> None:
@@ -117,18 +123,22 @@ def main() -> int:
                 print("Nothing to patch — pass --patient-id or "
                       "--physician-user-id.")
                 return
-            async with connection(cfg) as conn:
-                row = await get_target_by_name(conn, args.name)
-                if row is None:
-                    print(f"No target named {args.name!r}.")
-                    return
-                merged = dict(row.get("config_json") or {})
-                merged.update(patch)
-                await conn.execute(
-                    "UPDATE targets SET config_json = $1::jsonb WHERE id = $2",
-                    _json.dumps(merged), row["id"],
-                )
-                print(f"Updated {args.name!r}. New config_json: {merged}")
+            try:
+                async with connection(cfg) as conn:
+                    row = await get_target_by_name(conn, args.name)
+                    if row is None:
+                        print(f"No target named {args.name!r}.")
+                        return
+                    merged = dict(row.get("config_json") or {})
+                    merged.update(patch)
+                    await conn.execute(
+                        "UPDATE targets SET config_json = $1::jsonb "
+                        "WHERE id = $2",
+                        _json.dumps(merged), row["id"],
+                    )
+                    print(f"Updated {args.name!r}. New config_json: {merged}")
+            finally:
+                await close_pool()
 
         asyncio.run(_go())
         return 0
@@ -137,15 +147,18 @@ def main() -> int:
         import asyncio
 
         from agentforge_adversarial.config import Config
-        from agentforge_adversarial.db import connection
+        from agentforge_adversarial.db import close_pool, connection
         from agentforge_adversarial.targets import list_targets
 
         async def _go() -> None:
             cfg = Config.from_env()
-            async with connection(cfg) as conn:
-                rows = await list_targets(conn)
-            for r in rows:
-                print(f"  {r['name']:40} {r['target_type']:15} {r['target_url']}")
+            try:
+                async with connection(cfg) as conn:
+                    rows = await list_targets(conn)
+                for r in rows:
+                    print(f"  {r['name']:40} {r['target_type']:15} {r['target_url']}")
+            finally:
+                await close_pool()
 
         asyncio.run(_go())
         return 0

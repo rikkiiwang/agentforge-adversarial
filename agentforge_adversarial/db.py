@@ -31,3 +31,16 @@ async def init_schema(cfg: Config) -> None:
         for sql_file in sql_files:
             await conn.execute(sql_file.read_text())
             print(f"applied {sql_file.name}")
+
+
+async def close_pool() -> None:
+    """Drain + close the module-level pool so the event loop can exit
+    cleanly. Without this, `python -m agentforge_adversarial run` hangs
+    at shutdown for ~10s waiting for asyncpg's keepalive tasks to time
+    out. Safe to call multiple times; resets `_pool` to None so a later
+    `get_pool()` re-creates it (useful for tests that need a fresh pool).
+    """
+    global _pool
+    if _pool is not None:
+        await _pool.close()
+        _pool = None

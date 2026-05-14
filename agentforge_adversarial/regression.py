@@ -27,7 +27,7 @@ import asyncpg
 from openai import AsyncOpenAI
 
 from agentforge_adversarial.config import Config
-from agentforge_adversarial.db import connection
+from agentforge_adversarial.db import close_pool, connection
 from agentforge_adversarial.judges.ensemble import judge_attack_run
 from agentforge_adversarial.models import AttackRun
 from agentforge_adversarial.target import ChatClient, make_client
@@ -196,6 +196,31 @@ async def regress_all(
         AsyncOpenAI(api_key=cfg.openai_api_key) if cfg.openai_api_key else None
     )
 
+    try:
+        return await _regress_all_inner(
+            cfg,
+            target_name=target_name,
+            include_closed=include_closed,
+            dry_run=dry_run,
+            openai_client=openai_client,
+        )
+    finally:
+        # Same shutdown discipline as run_campaign — drain the asyncpg
+        # pool so the CLI exits promptly.
+        try:
+            await close_pool()
+        except Exception as e:
+            print(f"[regress] WARNING: pool close failed: {e!r}")
+
+
+async def _regress_all_inner(
+    cfg: Config,
+    *,
+    target_name: str | None,
+    include_closed: bool,
+    dry_run: bool,
+    openai_client: AsyncOpenAI | None,
+) -> list[RegressionResult]:
     async with connection(cfg) as conn:
         target_row = (
             await get_target_by_name(conn, target_name)
