@@ -2,8 +2,21 @@ from __future__ import annotations
 
 import os
 import time
+import warnings
 from pathlib import Path
 from uuid import UUID
+
+# pandas emits a UserWarning on every read_sql_query call when the
+# connection is a raw psycopg/asyncpg object rather than a SQLAlchemy
+# engine. Functionally the queries work — we just don't get the
+# SQLAlchemy type-mapping niceties we don't need. Migrating the whole
+# dashboard to SQLAlchemy for that warning is overkill, so silence it
+# at the source instead.
+warnings.filterwarnings(
+    "ignore",
+    message="pandas only supports SQLAlchemy connectable",
+    category=UserWarning,
+)
 
 import altair as alt
 import pandas as pd
@@ -287,7 +300,7 @@ with st.sidebar:
             f"pid: `{active['pid']}`"
         )
         if alive and st.button("⏹ Cancel", type="secondary", key="cancel_btn",
-                               use_container_width=True):
+                               width="stretch"):
             if cancel_campaign(int(active["pid"])):
                 st.warning(f"Cancel signal sent. {count} rows preserved.")
             else:
@@ -402,7 +415,7 @@ with tab_coverage:
                 text=alt.Text("count:Q"),
             )
         )
-        st.altair_chart(heat_chart + heat_labels, use_container_width=True)
+        st.altair_chart(heat_chart + heat_labels, width="stretch")
 
         # Lineage breakdown by source — surfaces the 4 source channels visually.
         st.markdown("##### Sources of attack runs")
@@ -432,7 +445,7 @@ with tab_coverage:
             )
             .properties(height=180)
         )
-        st.altair_chart(source_chart, use_container_width=True)
+        st.altair_chart(source_chart, width="stretch")
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -489,7 +502,7 @@ with tab_vulns:
                 ["case_id", "category", "subcategory", "severity", "state",
                  "target_version", "created_at"]
             ],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -733,7 +746,7 @@ with tab_runs:
                  "red_team_subagent_id", "judge_verdict",
                  "judge_rubric_version", "latency_ms"]
             ],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
