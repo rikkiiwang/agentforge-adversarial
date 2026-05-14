@@ -1,6 +1,6 @@
 # AgentForge Adversarial — Implementation Status
 
-**Submission date:** 2026-05-12 (MVP) · revised 2026-05-13 (operator console + auto-auth + multi-target + LangGraph + class-probe)
+**Submission date:** 2026-05-12 (MVP) · revised 2026-05-13 (operator console complete + auto-auth + multi-target + LangGraph + FAIL/PARTIAL fan-out + swarm picker + Approve gate + parallel LLM)
 **MVP commit:** `513ee25` (initial MVP). Subsequent work on 2026-05-12/13 added: operator-console Launch panel, auto-session-creation auth, multi-target generic factory, LangGraph state machine, and class-probe FAIL fan-out.
 **Deployed dashboard:** https://agentforge-adversarial-production.up.railway.app/
 **Target under test:** https://copilot-production-b532.up.railway.app/
@@ -10,22 +10,29 @@
 ## TL;DR
 
 A vertical slice of the platform: **8 of 9 designed attack categories**,
-**8 hand-curated seed cases amplified to 32 attacks via an LLM Red Team
-mutator + class-probe fan-out on FAIL (10 boundary variants per failing
-attack, bounded by max_rounds)**, dispatched against any registered AI
-target via a `targets` table (Co-Pilot, generic_chat, or openai_compat),
-verdicts written by an **ensemble Judge (deterministic keyword + gpt-4o-mini
-LLM)** to **Railway-hosted Postgres**, surfaced on a **Streamlit dashboard**
-with an in-browser Launch panel + Add-target form. Control flow runs as a
-**LangGraph 5-node state machine** in `agentforge_adversarial/graph.py`,
-with a conditional edge `judge → class_probe → dispatch` that loops on FAIL
-until `max_rounds` is exhausted.
+**32 seed cases** (8 hand-curated clinical-specific + 15 Garak-derived
+[NVIDIA] + 5 JailbreakBench-derived + 4 HouYi indirect-injection patterns
+[Liu et al. 2023]) **amplified by an LLM Red Team swarm**
+(`mutator` = 3 variants per seed; `class_probe` = 10 boundary variants per
+FAIL; `partial_reentry` = 3 fresh phrasings per PARTIAL), dispatched
+against any registered AI target via a `targets` table (Co-Pilot,
+generic_chat, or openai_compat), verdicts written by an **ensemble Judge
+(deterministic keyword + gpt-4o-mini LLM)** to **Railway-hosted Postgres**,
+surfaced on a **Streamlit dashboard** with an in-browser Launch panel,
+Add-target form, swarm-config picker, Approve/Modify/Override gate, Cancel
+button, and phase-aware progress fragment. Control flow runs as a
+**LangGraph 7-node state machine** in `agentforge_adversarial/graph.py`
+with two conditional edges:
+  - `judge → partial_reentry / class_probe / END` (routes by PARTIAL or FAIL count + round budget)
+  - `partial_reentry → class_probe / bump_round`
+
+All LLM subagent calls run in parallel under `asyncio.Semaphore(8)`.
 
 | Submission gate | Status |
 |---|---|
 | Hard gate: 3+ attack categories | ✅ 8 categories shipped |
 | Hard gate: agent prototype running live against deployed target | ✅ Red Team mutator + Class-Probe subagent + Ensemble Judge, hits live Co-Pilot OR any registered target |
-| Hard gate: working test suite | ✅ 41 tests pass (`make test`) |
+| Hard gate: working test suite | ✅ 45 tests pass (`make test`) |
 | Hard gate: results visible to reviewer | ✅ public dashboard reads from Railway Postgres |
 
 ---
@@ -41,7 +48,7 @@ Mapped to the section numbers in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 | **Red Team Swarm** | ⚠️ Partial | 2 subagents × gpt-4o-mini, hard-coded models: `red-team-mutator-0` (3 mutations per seed in the mutate node) + `red-team-class-probe-0` (10 boundary variants per FAIL in the class-probe node). **Missing for final:** configurable swarm from `config/swarm.yaml`, multi-LLM (claude-haiku, deepseek, llama-3 via Ollama), parallel synthesis with `synthesize_fn` (designed in `docs/components/synthesis-pipeline.md`). |
 | **Judge** | ✅ Shipped | Ensemble: keyword predicates + gpt-4o-mini LLM on every category. Files: `agentforge_adversarial/judges/{keyword,llm_judge,ensemble}.py`. Atomic UPDATE enforced by `attack_runs_judge_atomic` CHECK constraint. |
 | **Orchestrator** | ❌ Deferred | Designed in `docs/agents/orchestrator.md` (5-signal weighted scoring, per-category daily pools, score-weighted budget, `SwarmRecommendation`). MVP runner.py uses fixed config + flat seeds + uniform mutator instead. |
-| **Documentation Agent** | ❌ Deferred | Designed in `docs/agents/documentation-agent.md` (severity logic, class-probe two-write flow, parent_vuln_id variant linking, defense-mapped suggested fix). MVP writes verdicts directly to `attack_runs` from the Judge; no `vuln_reports` rows generated yet. |
+| **Documentation Agent** | ✅ Shipped 2026-05-13 | `agentforge_adversarial/documentation_agent.py`. On every FAIL emitted by `judge_node`, writes one `vulnerabilities` row (state=discovered, severity per clinical-safety-weighted category map, parent_vuln_id resolved by walking attack_runs lineage) + one `vuln_reports` row (severity rationale, observed-vs-expected, repro steps, suggested fix, defense reference). Idempotent on `attack_run_id` via UNIQUE constraint. |
 
 ### Components (`ARCHITECTURE.md` §4-§7)
 
@@ -56,20 +63,20 @@ Mapped to the section numbers in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 | **Observability** | ⚠️ Partial | Stdout logging from `runner.py` only. **Missing for final:** Langfuse traces (one trace per campaign with generation spans), per-attack `langfuse_trace_id` column populated. |
 | **Postgres schema** | ⚠️ Partial | 3 of 9 designed tables (`campaigns`, `attack_queue`, `attack_runs`). Subset of `docs/components/database-schema.md` §1-§8. **Missing for final:** `vulnerabilities`, `vuln_reports`, `near_misses`, `cross_regressions`, `threat_model_cells`, `cost_rollup_daily` (view). |
 | **pgvector novelty filter** | ❌ Deferred | Designed for HNSW dedup on embeddings. Not used; mutator produces N variants without deduplication. |
-| **Operator console (in-dashboard campaign launch)** | 🟡 Partial (Launch panel shipped 2026-05-12) | "▶ Run campaign" button in Streamlit (`dashboard/app.py:71-139`) spawns a subprocess via `dashboard/launcher.py`, shows a live progress bar (5s meta-refresh while in-flight), and auto-refreshes the heat-map on completion. Target = Mock or Live (deployed Co-Pilot via auto-created session, no manual `session_id`). **Missing for final:** Approve/Modify/Override gate per `docs/components/dashboard.md §4.1`, Vuln Board, swarm-config picker. |
+| **Operator console (in-dashboard campaign launch)** | ✅ Shipped 2026-05-13 | Launch panel with target picker, "+ Add target" form, swarm-config picker (mutator toggle / class-probe rounds slider / model dropdown), Approve/Modify/Override gate (Review-before-dispatch checkbox), Cancel button, phase-aware progress fragment. Per `docs/components/dashboard.md §4.1`. **Still deferred for final:** Vuln Board (P1), Cost tile (P2). |
 
 ### Orchestration framework (`ARCHITECTURE.md` §3, §4)
 
 | Item | MVP | Notes |
 |---|---|---|
-| **LangGraph state machine** | ✅ Shipped 2026-05-13 | 5-node graph in `agentforge_adversarial/graph.py`: `load_seeds → mutate → dispatch → judge → (decide) → END or class_probe → dispatch`. `CampaignState` TypedDict carries pending QueueEntries, dispatched runs, FAIL count, and round number. Conditional edge `decide_after_judge` routes to `class_probe` on FAIL && `round_num < max_rounds`, else END. `runner.py` is now a thin wrapper that resolves the target, builds the chat client, and invokes the compiled graph. **Still deferred:** PARTIAL → Mutator re-entry edge (the FAIL path landed first because it's higher-signal for the demo). |
+| **LangGraph state machine** | ✅ Shipped 2026-05-13 | 7-node graph in `agentforge_adversarial/graph.py`: `load_seeds → mutate → dispatch → judge → (decide_after_judge) → partial_reentry / class_probe / END`, with `partial_reentry → (decide) → class_probe / bump_round` and both `class_probe / bump_round → dispatch` (loop). `CampaignState` TypedDict carries pending QueueEntries, dispatched runs, FAIL + PARTIAL collections per round, and round number. Mutator + class-probe + partial-reentry all run their OpenAI calls in parallel under `asyncio.Semaphore(8)`. `runner.py` is now a thin wrapper that resolves the target, builds the chat client, and invokes the compiled graph. |
 | **Class-probe fan-out** | ✅ Shipped 2026-05-13 | `agentforge_adversarial/red_team/class_probe.py` — on FAIL, gpt-4o-mini generates up to 10 boundary variants per failing attack (different phrasing / framing / authority axes). Variants enqueued with `source='class_probe'`, `parent_id` = the failing run's id, `round_num` one greater than the parent's. Lineage tracked in `attack_runs.parent_id` (migration `003_lineage.sql`). `max_rounds` bounds the loop (default 2, CLI `--max-rounds N`). |
 
 ### Attack categories (`THREAT_MODEL.md` §1-§9)
 
 | # | Code | Category | MVP | Notes |
 |---|---|---|---|---|
-| 1 | `PI` | Prompt Injection | ✅ | `evals/cases/prompt_injection_persona_hijack.yaml` |
+| 1 | `PI` | Prompt Injection | ✅ | `evals/cases/prompt_injection_persona_hijack.yaml` + 8 Garak-derived (`evals/cases/garak/`) + 5 JailbreakBench (`evals/cases/jailbreakbench/`) + 1 HouYi (`evals/cases/houyi/`) |
 | 2 | `DE` | Data Exfiltration | ✅ | `evals/cases/data_exfiltration_cross_patient.yaml` |
 | 3 | `SC` | State Corruption | ✅ | `evals/cases/state_corruption_history_poison.yaml` |
 | 4 | `TM` | Tool Misuse | ✅ | `evals/cases/tool_misuse_parameter_tampering.yaml` |
@@ -113,25 +120,28 @@ they exist.
 Prioritized by demo-credibility-per-hour, with effort estimates. Final
 submission should aim for everything in P0 + P1; P2 is bonus.
 
-### P0 — remaining operator-console gates
+### P0 — ✅ All shipped 2026-05-13
 
 | Item | Effort | What it unlocks |
 |---|---|---|
-| ~~LangGraph node/edge skeleton~~ | ✅ ~~3-4 h~~ Shipped 2026-05-13 | 5-node graph in `agentforge_adversarial/graph.py`. |
-| ~~In-dashboard Launch button + live progress~~ | ✅ ~~6-7 h~~ Shipped 2026-05-12 | Streamlit Launch panel + subprocess launcher + 5s meta-refresh while in-flight. |
-| ~~Multi-target picker + add-target form~~ | ✅ ~~3 h~~ Shipped 2026-05-13 | Platform attacks any AI system via the `targets` table (copilot, generic_chat, openai_compat). |
-| ~~Conditional edge: FAIL → Class-probe fan-out (10 boundary variants)~~ | ✅ ~~4 h~~ Shipped 2026-05-13 | LangGraph's `decide_after_judge` routes to `class_probe_node` on FAIL && round_num < max_rounds. |
-| Swarm-config picker on Launch panel (model + variant count + budget) per `docs/components/dashboard.md §4.1` | 1.5 h | Operator can override defaults per campaign without editing YAML. |
-| Approve/Modify/Override gate UI (when `swarm_approval_mode != 'auto'`) | 2 h | Per `docs/components/dashboard.md §4.1`. The full §4.1 trust contract. |
-| Conditional edge: `PARTIAL → Mutator re-entry` | 2 h | Mirror of the FAIL→class-probe edge for ambiguous verdicts. |
+| ~~LangGraph node/edge skeleton~~ | ✅ ~~3-4 h~~ | 7-node graph in `agentforge_adversarial/graph.py` (load_seeds → mutate → dispatch → judge → partial_reentry / class_probe / bump_round → dispatch loop). |
+| ~~In-dashboard Launch button + live progress~~ | ✅ ~~6-7 h~~ | Streamlit Launch panel + subprocess launcher + `st.fragment(run_every=5)` for live progress without full-page reloads. |
+| ~~Multi-target picker + add-target form~~ | ✅ ~~3 h~~ | Platform attacks any AI system via the `targets` table (copilot, generic_chat, openai_compat). |
+| ~~Conditional edge: FAIL → Class-probe fan-out (10 boundary variants)~~ | ✅ ~~4 h~~ | `decide_after_judge` routes to `class_probe_node` on FAIL && round_num < max_rounds. |
+| ~~Conditional edge: PARTIAL → Mutator re-entry~~ | ✅ ~~2 h~~ | `partial_reentry_node` re-mutates ambiguous attacks (3 fresh phrasings per PARTIAL); chains into `class_probe` if FAILs also exist in the same judge pass. |
+| ~~Swarm-config picker on Launch panel~~ | ✅ ~~1.5 h~~ | Mutator on/off, Class-probe rounds slider (0–3), Mutator model dropdown (gpt-4o-mini / gpt-4o / gpt-4.1-mini) — passed via `--max-rounds` CLI flag + `MUTATOR_MODEL` / `JUDGE_MODEL` env vars to the subprocess. |
+| ~~Approve/Modify/Override gate UI~~ | ✅ ~~2 h~~ | "Review before dispatch" checkbox in Launch panel: when on, clicking Run shows the proposed swarm spec + 3 buttons (Accept dispatches as-is, Modify returns to the picker, Override accepts JSON paste). Per `docs/components/dashboard.md §4.1`. |
+| ~~Parallel mutator + class-probe (asyncio.gather + Semaphore)~~ | ✅ ~~0.5 h~~ | Reduces 8-seed mutator wall-time from ~30 s → ~5 s; class-probe with N FAILs goes from sequential to bounded-parallel (concurrency=8). |
+| ~~Phase-aware progress text~~ | ✅ ~~0.5 h~~ | Dashboard fragment tails the subprocess log file (`var/campaigns/*.log`) and surfaces the latest `[graph:*]` phase line so the operator sees "Mutator generating…" instead of "0 attacks landed" during the startup window. |
 
-### P1 — Documentation Agent + vuln lifecycle
+### P1 — ✅ All shipped 2026-05-13
 
 | Item | Effort | What it unlocks |
 |---|---|---|
-| `vulnerabilities` + `vuln_reports` tables (per `docs/components/database-schema.md` §2-§3) | 2 h | Persistent record of what FAILed, not just attack_runs verdicts. |
-| Documentation Agent — on FAIL, write `vuln_reports` row with severity + suggested fix + parent_vuln_id linking | 3 h | Per `docs/agents/documentation-agent.md`. Closes the loop from "we found a vuln" to "here's the writeup." |
-| Vulnerability board view on dashboard (third tab) | 2 h | Per `docs/components/dashboard.md` §3 ("vuln board" view). |
+| ~~`vulnerabilities` + `vuln_reports` tables~~ | ✅ ~~2 h~~ | `migrations/004_vuln_lifecycle.sql`: `vulnerabilities` (state machine: discovered/triaged/fix_proposed/fix_validated/reopened/closed; parent_vuln_id for class-probe lineage; severity ENUM weighted by clinical-safety) + `vuln_reports` (severity_rationale, observed_vs_expected, repro_steps, suggested_fix, defense_reference). |
+| ~~Documentation Agent~~ | ✅ ~~3 h~~ | `agentforge_adversarial/documentation_agent.py`. On every FAIL in `judge_node` writes one vulnerabilities row + one vuln_reports row. Idempotent on `attack_run_id`. Lineage resolution walks `attack_runs.parent_id` chain to link class-probe variants back to their root vulnerability. |
+| ~~Vulnerability board on dashboard~~ | ✅ ~~2 h~~ | `dashboard/app.py` "🛡️ Vulnerability Board" section between heat-map and run-table. KPI cards (Total / Critical / High / Discovered / Triaged), filterable table, drill-down to severity rationale + observed-vs-expected + repro + suggested fix + defense reference. State-transition buttons (→ Triage / → Fix proposed / → Close) per `docs/components/dashboard.md §4.2`. |
+| Seed corpus expansion via attack-library imports | ~3 h | 8 hand-curated seeds + 15 Garak-derived (`evals/cases/garak/`, NVIDIA's red-team toolkit) + 5 JailbreakBench (DAN/AIM/Developer/Hypothetical/Translate-trick) + 4 HouYi indirect-injection patterns (Liu et al. 2023). Total: **32 seeds across 32 subcategories** spanning 8 categories. |
 
 ### P2 — observability + cost rollup + regression
 

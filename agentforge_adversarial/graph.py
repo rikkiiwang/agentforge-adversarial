@@ -25,6 +25,7 @@ Nodes:
 """
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Annotated, Any, TypedDict
 from uuid import UUID
@@ -35,6 +36,7 @@ from openai import AsyncOpenAI
 from agentforge_adversarial.cases import load_cases
 from agentforge_adversarial.config import Config
 from agentforge_adversarial.db import connection
+from agentforge_adversarial.documentation_agent import document_fail
 from agentforge_adversarial.judges.ensemble import (
     judge_attack_run,
     update_attack_run_with_verdict,
@@ -58,6 +60,7 @@ from agentforge_adversarial.target import (
 
 
 MAX_ROUNDS_DEFAULT = 2
+LLM_CONCURRENCY = 8  # cap on parallel OpenAI calls (mutator + class-probe)
 
 
 def _accumulate(left: list, right: list) -> list:
@@ -72,6 +75,7 @@ class CampaignState(TypedDict, total=False):
     target_version: str
     cases_path: Path
     mutate: bool
+    mutations_per_seed: int
     max_rounds: int
     openai_client: AsyncOpenAI | None
     chat_client: ChatClient
@@ -81,7 +85,8 @@ class CampaignState(TypedDict, total=False):
     pending: list[QueueEntry]  # consumed by dispatch each round
     dispatched_this_round: list[AttackRun]  # judge reads this
     completed: Annotated[list[AttackRun], _accumulate]
-    fails_this_round: list[AttackRun]  # class_probe reads this
+    fails_this_round: list[AttackRun]  # fan_out reads this
+    partials_this_round: list[AttackRun]  # fan_out reads this
     round_num: int
 
 
@@ -119,14 +124,34 @@ async def mutate_node(state: CampaignState) -> dict[str, Any]:
     seeds_entries = state.get("pending") or []
     seed_cases = load_cases(state["cases_path"])
     by_case_id = {c.id: c for c in seed_cases}
-    extras = []
     openai_client = state["openai_client"]
-    for entry in seeds_entries:
+    # Sequential `for await` made the mutator dominate wall-clock time
+    # (8 seeds × ~4s per OpenAI call = 32s before any dispatch). Parallelize
+    # under a Semaphore so we stay under OpenAI rate limits.
+    sem = asyncio.Semaphore(LLM_CONCURRENCY)
+
+    n_per_seed = int(state.get("mutations_per_seed", 3))
+
+    async def _mutate_one(entry):
         seed = by_case_id.get(entry.case_id)
         if seed is None:
+            return []
+        async with sem:
+            return await mutate_case(openai_client, seed, n=n_per_seed)
+
+    print(
+        f"[graph:mutate] generating {n_per_seed} mutations/seed for "
+        f"{len(seeds_entries)} seeds in parallel (concurrency={LLM_CONCURRENCY})"
+    )
+    results = await asyncio.gather(
+        *(_mutate_one(e) for e in seeds_entries), return_exceptions=True
+    )
+    extras: list = []
+    for r in results:
+        if isinstance(r, Exception):
+            print(f"[graph:mutate] WARNING: a mutator call failed: {type(r).__name__}")
             continue
-        seed_mutations = await mutate_case(openai_client, seed)
-        extras.extend(seed_mutations)
+        extras.extend(r)
     print(f"[graph:mutate] produced {len(extras)} mutations across {len(seeds_entries)} seeds")
     if not extras:
         return {}
@@ -138,7 +163,10 @@ async def mutate_node(state: CampaignState) -> dict[str, Any]:
             red_team_subagent_id=MUTATOR_SUBAGENT_ID,
             red_team_model=MUTATOR_MODEL,
         )
-    return {"pending": mut_entries}
+    # IMPORTANT: combine with the seeds that load_seeds_node already put in
+    # pending — returning just `mut_entries` would overwrite them, and only
+    # the mutations would reach dispatch.
+    return {"pending": (state.get("pending") or []) + mut_entries}
 
 
 async def dispatch_node(state: CampaignState) -> dict[str, Any]:
@@ -159,11 +187,18 @@ async def dispatch_node(state: CampaignState) -> dict[str, Any]:
 
 
 async def judge_node(state: CampaignState) -> dict[str, Any]:
-    """Ensemble Judge each run dispatched this round."""
+    """Ensemble Judge each run dispatched this round.
+
+    Both FAIL and PARTIAL feed conditional edges in `decide_after_judge`:
+    FAIL fans out via class-probe (10 boundary variants each), PARTIAL re-
+    enters the mutator (3 fresh phrasings each, aiming to disambiguate the
+    ambiguous verdict in the next round).
+    """
     cfg = state["cfg"]
     openai_client = state.get("openai_client")
     dispatched: list[AttackRun] = state.get("dispatched_this_round") or []
     fails: list[AttackRun] = []
+    partials: list[AttackRun] = []
     async with connection(cfg) as conn:
         for run in dispatched:
             verdict = await judge_attack_run(run, openai_client=openai_client)
@@ -178,8 +213,19 @@ async def judge_node(state: CampaignState) -> dict[str, Any]:
             )
             if verdict.verdict == "fail":
                 fails.append(run)
-    print(f"[graph:judge] judged {len(dispatched)} runs; FAIL count this round = {len(fails)}")
-    return {"fails_this_round": fails}
+                # Documentation Agent: write vulnerabilities + vuln_reports
+                # rows for every FAIL. Idempotent on attack_run_id.
+                try:
+                    await document_fail(conn, run)
+                except Exception as e:
+                    print(f"[graph:judge] WARNING: document_fail failed: {e!r}")
+            elif verdict.verdict == "partial":
+                partials.append(run)
+    print(
+        f"[graph:judge] judged {len(dispatched)} runs; "
+        f"FAIL={len(fails)} PARTIAL={len(partials)}"
+    )
+    return {"fails_this_round": fails, "partials_this_round": partials}
 
 
 async def class_probe_node(state: CampaignState) -> dict[str, Any]:
@@ -192,10 +238,26 @@ async def class_probe_node(state: CampaignState) -> dict[str, Any]:
     if openai_client is None or not fails:
         print(f"[graph:class_probe] no fan-out (no FAILs or no LLM); ending round {next_round}")
         return {"round_num": next_round, "fails_this_round": []}
+    print(
+        f"[graph:class_probe] round {next_round}: generating variants for "
+        f"{len(fails)} FAILs in parallel (concurrency={LLM_CONCURRENCY})"
+    )
+    sem = asyncio.Semaphore(LLM_CONCURRENCY)
+
+    async def _probe_one(failing_run):
+        async with sem:
+            return failing_run, await generate_boundary_variants(openai_client, failing_run)
+
+    results = await asyncio.gather(
+        *(_probe_one(f) for f in fails), return_exceptions=True
+    )
     new_entries: list[QueueEntry] = []
     async with connection(cfg) as conn:
-        for failing_run in fails:
-            variants = await generate_boundary_variants(openai_client, failing_run)
+        for r in results:
+            if isinstance(r, Exception):
+                print(f"[graph:class_probe] WARNING: a probe call failed: {type(r).__name__}")
+                continue
+            failing_run, variants = r
             if not variants:
                 continue
             entries = await enqueue_cases(
@@ -219,14 +281,138 @@ async def class_probe_node(state: CampaignState) -> dict[str, Any]:
     }
 
 
+async def partial_reentry_node(state: CampaignState) -> dict[str, Any]:
+    """For each PARTIAL this round, ask the mutator to produce 3 fresh
+    phrasings of the attack — these aim to push the next round's verdict
+    into a clear PASS or FAIL.
+
+    Variants are enqueued with `parent_id` = the PARTIAL'd run's id and
+    `round_num` = round_num + 1. Source remains 'random' (same as mutator
+    output); the partial-reentry origin is recoverable via parent_id lineage.
+    """
+    cfg = state["cfg"]
+    openai_client = state.get("openai_client")
+    partials = state.get("partials_this_round") or []
+    round_num = state.get("round_num", 0)
+    next_round = round_num + 1
+    if openai_client is None or not partials:
+        print(
+            f"[graph:partial_reentry] no fan-out (no PARTIALs or no LLM); "
+            f"round stays {round_num}"
+        )
+        return {"partials_this_round": []}
+    print(
+        f"[graph:partial_reentry] round {next_round}: re-mutating "
+        f"{len(partials)} PARTIALs in parallel (concurrency={LLM_CONCURRENCY})"
+    )
+    sem = asyncio.Semaphore(LLM_CONCURRENCY)
+    seed_cases = load_cases(state["cases_path"])
+    by_case_id = {c.id: c for c in seed_cases}
+
+    async def _reentry_one(partial_run):
+        # Build an EvalCase view of the PARTIAL'd run to feed the mutator.
+        # Prefer the original seed (canonical phrasing); fall back to the
+        # AttackRun if the case_id was a mutation (e.g. PI-PH-001-MUT-2).
+        seed_id = partial_run.case_id.split("-MUT-")[0].split("-CP-")[0]
+        seed = by_case_id.get(seed_id)
+        if seed is None:
+            # Synthesize a minimal EvalCase from the PARTIAL'd run so the
+            # mutator has the same prompt + expected-failure-mode context.
+            from agentforge_adversarial.models import EvalCase as _EC
+            seed = _EC(
+                id=partial_run.case_id,
+                category=partial_run.category,
+                subcategory=partial_run.subcategory,
+                channel=partial_run.channel,
+                source="random",
+                severity="high",
+                attack_prompt=partial_run.attack_prompt,
+                expected_safe_behavior="Refuse and explain why.",
+                expected_failure_mode=partial_run.expected_failure_mode,
+                regression=False,
+            )
+        async with sem:
+            return partial_run, await mutate_case(
+                openai_client, seed, n=int(state.get("mutations_per_seed", 3))
+            )
+
+    results = await asyncio.gather(
+        *(_reentry_one(p) for p in partials), return_exceptions=True
+    )
+    new_entries: list[QueueEntry] = []
+    async with connection(cfg) as conn:
+        for r in results:
+            if isinstance(r, Exception):
+                print(f"[graph:partial_reentry] WARNING: a re-mutate call failed: {type(r).__name__}")
+                continue
+            partial_run, variants = r
+            if not variants:
+                continue
+            entries = await enqueue_cases(
+                conn,
+                state["campaign_id"],
+                variants,
+                red_team_subagent_id=MUTATOR_SUBAGENT_ID,
+                red_team_model=MUTATOR_MODEL,
+                parent_id=partial_run.id,
+                round_num=next_round,
+            )
+            new_entries.extend(entries)
+    print(
+        f"[graph:partial_reentry] round {next_round}: re-mutated "
+        f"{len(partials)} PARTIALs into {len(new_entries)} fresh phrasings"
+    )
+    # Note: we deliberately do NOT bump round_num here. That happens in
+    # class_probe_node OR — if there are no FAILs to fan out — in
+    # `bump_round_node` (added below) so that round_num is incremented
+    # exactly once per logical round regardless of which fan-out edges fired.
+    return {
+        "pending": (state.get("pending") or []) + new_entries,
+        "partials_this_round": [],
+    }
+
+
+async def bump_round_node(state: CampaignState) -> dict[str, Any]:
+    """When PARTIAL re-entry fired but class-probe didn't (no FAILs), this
+    node increments round_num so the conditional edge sees the round budget
+    advance. Idempotent — class_probe also bumps it when it fires."""
+    return {"round_num": state.get("round_num", 0) + 1}
+
+
 def decide_after_judge(state: CampaignState) -> str:
-    """Conditional edge: fan out if any FAIL and round budget remains."""
+    """Conditional edge after judging this round's dispatch.
+
+    Routes:
+      - PARTIAL exists  → partial_reentry (which then chains into class_probe
+        or directly to dispatch depending on FAIL count)
+      - FAIL exists     → class_probe
+      - else            → END
+
+    All routes are gated by `round_num < max_rounds` so the loop can't run
+    away. PARTIAL is checked first because re-mutated variants might
+    themselves FAIL, and we want to give them a chance to fan-out in the
+    next round.
+    """
     fails = state.get("fails_this_round") or []
+    partials = state.get("partials_this_round") or []
     round_num = state.get("round_num", 0)
     max_rounds = state.get("max_rounds", MAX_ROUNDS_DEFAULT)
-    if fails and round_num < max_rounds:
+    if round_num >= max_rounds:
+        return END
+    if partials:
+        return "partial_reentry"
+    if fails:
         return "class_probe"
     return END
+
+
+def decide_after_partial_reentry(state: CampaignState) -> str:
+    """After partial_reentry, run class-probe too if there are FAILs from the
+    same judge pass. Otherwise hop straight to bump_round + dispatch."""
+    fails = state.get("fails_this_round") or []
+    if fails:
+        return "class_probe"
+    return "bump_round"
 
 
 def build_graph() -> Any:
@@ -235,13 +421,29 @@ def build_graph() -> Any:
     g.add_node("mutate", mutate_node)
     g.add_node("dispatch", dispatch_node)
     g.add_node("judge", judge_node)
+    g.add_node("partial_reentry", partial_reentry_node)
     g.add_node("class_probe", class_probe_node)
+    g.add_node("bump_round", bump_round_node)
 
     g.set_entry_point("load_seeds")
     g.add_edge("load_seeds", "mutate")
     g.add_edge("mutate", "dispatch")
     g.add_edge("dispatch", "judge")
-    g.add_conditional_edges("judge", decide_after_judge, {"class_probe": "class_probe", END: END})
+    g.add_conditional_edges(
+        "judge",
+        decide_after_judge,
+        {
+            "partial_reentry": "partial_reentry",
+            "class_probe": "class_probe",
+            END: END,
+        },
+    )
+    g.add_conditional_edges(
+        "partial_reentry",
+        decide_after_partial_reentry,
+        {"class_probe": "class_probe", "bump_round": "bump_round"},
+    )
     g.add_edge("class_probe", "dispatch")
+    g.add_edge("bump_round", "dispatch")
 
     return g.compile()

@@ -76,16 +76,17 @@ Postgres, surfaced on a Streamlit dashboard.
 | Keyword Judge | ✅ category-specific marker sets + DoS length predicate (response > 2000 chars) |
 | LLM Judge (gpt-4o-mini) | ✅ runs on **every** category; SYSTEM_PROMPT is category-general and uses each seed's `expected_failure_mode` as the per-category rubric anchor |
 | Ensemble Judge | ✅ keyword + LLM combined; agreement / disagreement recorded in `judge_reasoning` |
-| Red Team mutator subagent (gpt-4o-mini) | ✅ 3 mutations per seed, `source='random'` |
-| Red Team class-probe subagent (gpt-4o-mini) | ✅ 10 boundary variants per FAIL, `source='class_probe'`, parent lineage via `attack_runs.parent_id` |
-| LangGraph state machine | ✅ 5 nodes (load_seeds → mutate → dispatch → judge → class_probe) + conditional edge `judge → class_probe → dispatch` on FAIL, bounded by `--max-rounds` |
+| Red Team mutator subagent (gpt-4o-mini) | ✅ 3 mutations per seed, `source='random'`, parallel via `asyncio.gather` |
+| Red Team class-probe subagent (gpt-4o-mini) | ✅ 10 boundary variants per FAIL, `source='class_probe'`, parent lineage via `attack_runs.parent_id`, parallel via `asyncio.gather` |
+| Red Team partial-reentry subagent (gpt-4o-mini) | ✅ 3 fresh phrasings per PARTIAL to disambiguate ambiguous verdicts, parent lineage via `attack_runs.parent_id` |
+| LangGraph state machine | ✅ 7 nodes (load_seeds → mutate → dispatch → judge → partial_reentry / class_probe / bump_round → dispatch). Two conditional edges: `decide_after_judge` (PARTIAL/FAIL/END) + `decide_after_partial_reentry` (class_probe/bump_round). Bounded by `--max-rounds`. |
 | Multi-target via `targets` table | ✅ 3 target types: `copilot` (auto-creates `/v1/sessions`), `generic_chat` (any HTTP/JSON LLM with a prompt template), `openai_compat` (OpenAI Chat Completions wire format) |
-| Streamlit dashboard | ✅ KPIs + heat-map + filterable run table + drill-down + ▶ Run campaign button + ➕ Add target form |
+| Streamlit dashboard | ✅ KPIs + heat-map + filterable run table + drill-down + Campaign selector + ▶ Run + ➕ Add target + ⏹ Cancel + swarm-config picker + Approve/Modify/Override gate + phase-aware progress fragment |
 
-**Headline deferred items:** Approve/Modify/Override gate + Vuln Board
-(rest of operator console), Documentation Agent, regression harness,
-Langfuse traces, PARTIAL→mutator re-entry edge, configurable swarm.
-Detailed matrix and effort estimates in [`IMPLEMENTATION.md`](IMPLEMENTATION.md).
+**Headline deferred items:** Vuln Board (P1), Documentation Agent (P1),
+regression harness (P2), Langfuse traces (P2), Multimodal & Document
+Poisoning category (P2), pgvector novelty dedup (not planned). All P0
+items shipped 2026-05-13. Detailed matrix in [`IMPLEMENTATION.md`](IMPLEMENTATION.md).
 
 ### Setup
 
@@ -189,11 +190,10 @@ See **[`IMPLEMENTATION.md`](IMPLEMENTATION.md)** for the full status matrix
 (per-component MVP coverage, live verification results, prioritized gap to
 final submission with effort estimates).
 
-Short list of deferred items: operator-console Approve/Modify/Override
-gate + Vuln Board · Orchestrator scoring · synthesize_fn pipeline ·
-regression harness · Langfuse traces · pgvector novelty · Documentation
-Agent · PARTIAL→mutator re-entry edge. Refer to `ARCHITECTURE.md` for
-the full design intent.
+Short list of deferred items: Vuln Board · Orchestrator scoring ·
+synthesize_fn pipeline · regression harness · Langfuse traces · pgvector
+novelty · Documentation Agent · Multimodal/document-poisoning channel.
+Refer to `ARCHITECTURE.md` for the full design intent.
 
 ---
 

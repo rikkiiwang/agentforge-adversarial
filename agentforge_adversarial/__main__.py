@@ -27,6 +27,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Max class-probe rounds after the initial dispatch. "
              "0 disables fan-out. Default 2.",
     )
+    run_p.add_argument(
+        "--mutations-per-seed",
+        type=int,
+        default=3,
+        help="LLM mutations the Red Team mutator produces per seed "
+             "(also used by PARTIAL re-entry). Default 3.",
+    )
 
     sub.add_parser("init-db", help="Apply all SQL migrations in order")
     sub.add_parser("list-targets", help="Print all configured targets")
@@ -83,6 +90,7 @@ def main() -> int:
                 Config.from_env(),
                 Path(args.cases),
                 mutate=not args.no_mutate,
+                mutations_per_seed=args.mutations_per_seed,
                 target_name=args.target,
                 max_rounds=args.max_rounds,
             )
