@@ -147,10 +147,29 @@ def _transition_vuln_state(vuln_id: str, new_state: str, actor: str = "operator"
 # ─────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="AgentForge Adversarial",
+    page_title="AI Security Platform",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+def _format_cost(usd: float) -> str:
+    """Pick a sensible precision for the cost tile.
+
+    `$0.0000` looks broken even though it's technically correct; show
+    something readable at every magnitude instead:
+      - $0       when the buffer hasn't received any usage yet
+      - 0.XX¢    for sub-cent costs (1¢ = $0.01)
+      - $0.XX    for cents-to-dollars
+      - $X.XX    for ≥ $1
+    """
+    if usd <= 0:
+        return "$0"
+    if usd < 0.01:
+        return f"{usd * 100:.2f}¢"
+    if usd < 1:
+        return f"${usd:.3f}"
+    return f"${usd:.2f}"
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -160,8 +179,8 @@ st.set_page_config(
 campaigns_df = fetch_campaigns()
 
 with st.sidebar:
-    st.markdown("### 🤖 AgentForge")
-    st.caption(f"AI Security Platform · DB: **{DEPLOY_ENV}**")
+    st.markdown("### 🛡️ AI Security Platform")
+    st.caption(f"AgentForge Adversarial · DB: **{DEPLOY_ENV}**")
     st.divider()
 
     # --- Campaign scope ---
@@ -224,7 +243,7 @@ with st.sidebar:
             tokens_out = int(crow["total_tokens_out"].iloc[0]) if not crow.empty else 0
         st.metric(
             "Red-team LLM cost",
-            f"${cost_total:.4f}",
+            _format_cost(cost_total),
             help=(
                 "Cost of OpenAI calls for Judge + mutator + class-probe + "
                 "partial-reentry. Target's own LLM bill is not visible to "
