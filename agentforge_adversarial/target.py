@@ -56,6 +56,10 @@ def make_client(target_row: dict[str, Any]) -> ChatClient:
             response_path=cfg.get("response_path") or "response",
             headers=cfg.get("headers") or {},
         )
+    if t == "mock":
+        # In-process stub. Useful for first-run / offline demos — needs
+        # no env vars and makes no network calls.
+        return MockCopilotClient()
     if t == "openai_compat":
         return GenericChatClient(
             url,

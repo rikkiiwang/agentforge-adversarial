@@ -116,12 +116,24 @@ make up                                 # docker compose up -d (Postgres :5433)
 make init-db                            # apply migrations/001_initial.sql
 ```
 
-### Run a campaign — mock target (default)
+### Run a campaign — mock target (frictionless first-run)
+
+The seeded `Mock Co-Pilot (local stub)` target (`migrations/006_mock_target.sql`)
+runs `MockCopilotClient` in-process — no env vars, no network. It seeds
+deliberate vulnerabilities across the MVP categories so the Judge has
+something to score.
 
 ```bash
-make run                                # 32 seeds + 3 mutations each (mutator is on by default)
-make run-no-mutate                      # 32 seeds only (mutator off)
+make run                                # 32 seeds + 3 mutations each → mock target
+make run-no-mutate                      # 32 seeds only (mutator off) → mock target
 make dashboard                          # http://localhost:8501
+```
+
+For an explicit target choice from the CLI:
+
+```bash
+.venv/bin/python -m agentforge_adversarial run \
+  --cases evals/cases --target "Mock Co-Pilot (local stub)"
 ```
 
 ### Run a campaign — deployed Co-Pilot target

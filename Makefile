@@ -21,7 +21,7 @@ help:
 	@echo "  make init-db        Apply migrations/001_initial.sql"
 	@echo ""
 	@echo "  make test           Run the full test suite"
-	@echo "  make run            Run a campaign against MockCopilotClient"
+	@echo "  make run            Run a campaign against the mock target (no env vars needed)"
 	@echo "  make run-no-mutate  Run seeds only (mutator off; mutator is on by default)"
 	@echo "  make run-live       Run against the deployed Co-Pilot (needs COPILOT_PATIENT_ID)"
 	@echo "  make dashboard      Launch Streamlit on http://localhost:8501"
@@ -47,13 +47,18 @@ init-db:
 test:
 	$(PYTEST) -v
 
+# Default: in-process MockCopilotClient via the seeded mock target row
+# (`migrations/006_mock_target.sql`). No env vars, no network. Use this
+# for first-run / offline demos.
 run:
-	$(PY) -m agentforge_adversarial run --cases evals/cases
+	$(PY) -m agentforge_adversarial run --cases evals/cases \
+	  --target "Mock Co-Pilot (local stub)"
 
-# Seeds-only (mutator off). Mutator is on by default — use --no-mutate to
-# disable it. Live vs mock is now chosen by the `targets` table row.
+# Seeds-only (mutator off). Mutator is on by default — use --no-mutate
+# to disable it. Live vs mock is chosen by --target.
 run-no-mutate:
-	$(PY) -m agentforge_adversarial run --cases evals/cases --no-mutate
+	$(PY) -m agentforge_adversarial run --cases evals/cases --no-mutate \
+	  --target "Mock Co-Pilot (local stub)"
 
 # Live = the seeded deployed Co-Pilot target. Requires COPILOT_PATIENT_ID
 # (a Synthea UUID) — make_client() reads it as a fallback when the target
