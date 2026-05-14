@@ -18,7 +18,7 @@ help:
 	@echo "  make venv           Create .venv with Python 3.11"
 	@echo "  make install        pip install -e \".[dev]\" into the venv"
 	@echo "  make up             docker compose up -d (Postgres on :5433)"
-	@echo "  make init-db        Apply migrations/001_initial.sql"
+	@echo "  make init-db        Apply all SQL migrations in order (idempotent)"
 	@echo ""
 	@echo "  make test           Run the full test suite"
 	@echo "  make run            Run a campaign against the mock target (no env vars needed)"

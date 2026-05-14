@@ -113,7 +113,7 @@ cp .env.example .env                    # fill in OPENAI_API_KEY (optional)
 make venv                               # create .venv with Python 3.11
 make install                            # pip install -e ".[dev]"
 make up                                 # docker compose up -d (Postgres :5433)
-make init-db                            # apply migrations/001_initial.sql
+make init-db                            # apply all migrations/*.sql in order (idempotent)
 ```
 
 ### Run a campaign — mock target (frictionless first-run)
@@ -197,12 +197,20 @@ laptop-side CLI is needed once `COPILOT_PATIENT_ID` is configured.
    - Copy `Postgres → Variables → DATABASE_URL` (the public/connect URL,
      not the internal one).
 
-2. **Apply schema** (one-time, from your laptop):
+2. **Apply schema** (re-run after every new migration; the command is
+   idempotent so this is safe to run on every deploy):
 
    ```bash
    export RAILWAY_DATABASE_URL='postgresql://...railway.app:.../railway?sslmode=require'
    DATABASE_URL="$RAILWAY_DATABASE_URL" .venv/bin/python -m agentforge_adversarial init-db
    ```
+
+   `init-db` runs every `migrations/*.sql` in order; the current set is
+   001 (core schema) → 002 (targets) → 003 (lineage) → 004 (vuln
+   lifecycle) → 005 (cost rollup) → 006 (mock target seed). Each
+   migration is wrapped in `DO $$ BEGIN ... EXCEPTION WHEN ...` blocks
+   or `IF NOT EXISTS` guards, so running this against a populated DB
+   is a no-op for already-applied rows.
 
 3. **Deploy the Streamlit service**
    - Inside the same Railway project: **+ New → GitHub Repo →
