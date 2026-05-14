@@ -43,6 +43,7 @@ from agentforge_adversarial.judges.ensemble import (
 )
 from agentforge_adversarial.llm import MUTATOR_MODEL
 from agentforge_adversarial.models import AttackRun, QueueEntry
+from agentforge_adversarial import cost
 from agentforge_adversarial.queue import create_campaign, enqueue_cases
 from agentforge_adversarial.red_team.class_probe import (
     CLASS_PROBE_SUBAGENT_ID,
@@ -104,6 +105,7 @@ async def load_seeds_node(state: CampaignState) -> dict[str, Any]:
             target_id=state["target_row"]["id"],
         )
         entries = await enqueue_cases(conn, campaign_id, seeds)
+    cost.set_campaign(str(campaign_id))
     print(f"[graph:load_seeds] campaign {campaign_id}, enqueued {len(entries)} seeds")
     print(f"[campaign] created {campaign_id} (target_version={state['target_version']})")
     return {

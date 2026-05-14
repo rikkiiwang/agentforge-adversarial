@@ -5,6 +5,7 @@ import json
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ValidationError
 
+from agentforge_adversarial import cost
 from agentforge_adversarial.llm import JUDGE_MODEL
 from agentforge_adversarial.models import JudgeResult
 
@@ -70,6 +71,7 @@ async def judge_llm(
             response_format={"type": "json_object"},
             temperature=0.0,
         )
+        cost.record(resp, JUDGE_MODEL)
         raw = json.loads(resp.choices[0].message.content or "{}")
         parsed = _LlmJudgeRaw.model_validate(raw)
     except (ValidationError, json.JSONDecodeError, Exception) as e:

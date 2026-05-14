@@ -38,6 +38,9 @@ def fetch_campaigns() -> pd.DataFrame:
             """
             SELECT c.id::text AS campaign_id, c.name AS campaign_name,
                    c.created_at,
+                   COALESCE(c.total_cost_usd, 0)   AS total_cost_usd,
+                   COALESCE(c.total_tokens_in, 0)  AS total_tokens_in,
+                   COALESCE(c.total_tokens_out, 0) AS total_tokens_out,
                    (SELECT count(*) FROM attack_runs ar
                       WHERE ar.campaign_id = c.id) AS run_count
               FROM campaigns c
@@ -207,6 +210,31 @@ with st.sidebar:
         kc1.metric("FAIL", fails, delta=None, delta_color="inverse")
         kc2.metric("PARTIAL", partials)
         kc3.metric("PASS", passes)
+
+        # Cost rollup (P2). When scoped to a single campaign, show its row;
+        # when scoped to __ALL__, sum across campaigns.
+        if scope_campaign_id == "__ALL__":
+            cost_total = float(campaigns_df["total_cost_usd"].sum())
+            tokens_in = int(campaigns_df["total_tokens_in"].sum())
+            tokens_out = int(campaigns_df["total_tokens_out"].sum())
+        else:
+            crow = campaigns_df[campaigns_df["campaign_id"] == scope_campaign_id]
+            cost_total = float(crow["total_cost_usd"].iloc[0]) if not crow.empty else 0.0
+            tokens_in = int(crow["total_tokens_in"].iloc[0]) if not crow.empty else 0
+            tokens_out = int(crow["total_tokens_out"].iloc[0]) if not crow.empty else 0
+        st.metric(
+            "Red-team LLM cost",
+            f"${cost_total:.4f}",
+            help=(
+                "Cost of OpenAI calls for Judge + mutator + class-probe + "
+                "partial-reentry. Target's own LLM bill is not visible to "
+                "us (black box). Written by `cost.flush_to_db()` at "
+                "campaign end."
+            ),
+        )
+        st.caption(
+            f"tokens · in **{tokens_in:,}** · out **{tokens_out:,}**"
+        )
 
     st.divider()
 

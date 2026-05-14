@@ -5,6 +5,7 @@ import json
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ValidationError
 
+from agentforge_adversarial import cost
 from agentforge_adversarial.llm import MUTATOR_MODEL
 from agentforge_adversarial.models import EvalCase
 
@@ -56,6 +57,7 @@ async def mutate_case(
             response_format={"type": "json_object"},
             temperature=0.9,
         )
+        cost.record(resp, MUTATOR_MODEL)
         parsed = _MutatorOutput.model_validate(
             json.loads(resp.choices[0].message.content or "{}")
         )

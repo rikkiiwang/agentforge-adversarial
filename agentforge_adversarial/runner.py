@@ -17,6 +17,7 @@ from openai import AsyncOpenAI
 
 from agentforge_adversarial.config import Config
 from agentforge_adversarial.db import connection
+from agentforge_adversarial import cost
 from agentforge_adversarial.graph import MAX_ROUNDS_DEFAULT, build_graph
 from agentforge_adversarial.target import ChatClient, make_client
 from agentforge_adversarial.targets import (
@@ -82,4 +83,12 @@ async def run_campaign(
         "chat_client": chat_client,
     }
     final_state = await graph.ainvoke(initial)
-    return final_state["campaign_id"]
+    campaign_id = final_state["campaign_id"]
+    # Flush per-campaign cost rollup. Failure here must not mask the
+    # campaign's primary result, so log + continue rather than re-raise.
+    try:
+        async with connection(cfg) as conn:
+            await cost.flush_to_db(conn, str(campaign_id))
+    except Exception as e:
+        print(f"[runner] WARNING: cost flush failed: {e!r}")
+    return campaign_id
