@@ -13,12 +13,15 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 
 from agentforge_adversarial.config import Config
+from agentforge_adversarial.cross_regression import detect_for_campaign
 from agentforge_adversarial.db import close_pool, connection
 from agentforge_adversarial import cost
 from agentforge_adversarial.graph import MAX_ROUNDS_DEFAULT, build_graph
+from agentforge_adversarial.llm import MUTATOR_MODEL, is_anthropic_model
 from agentforge_adversarial.target import ChatClient, auto_pick_patient_id, make_client
 from agentforge_adversarial.targets import (
     get_default_target,
@@ -40,6 +43,17 @@ async def run_campaign(
     openai_client = (
         AsyncOpenAI(api_key=cfg.openai_api_key) if cfg.openai_api_key else None
     )
+    # Red Team client: split from Judge by model family (ARCHITECTURE §2).
+    # Picks the provider that matches ``MUTATOR_MODEL``; falls back to None
+    # so the graph's mutate / class-probe nodes skip themselves cleanly when
+    # the required key is absent (same degradation path as ``openai_client``).
+    if is_anthropic_model(MUTATOR_MODEL):
+        red_team_client: AsyncOpenAI | AsyncAnthropic | None = (
+            AsyncAnthropic(api_key=cfg.anthropic_api_key)
+            if cfg.anthropic_api_key else None
+        )
+    else:
+        red_team_client = openai_client
 
     target_row: dict[str, Any]
     if chat_client is None:
@@ -100,6 +114,7 @@ async def run_campaign(
         "mutations_per_seed": mutations_per_seed,
         "max_rounds": max_rounds,
         "openai_client": openai_client,
+        "red_team_client": red_team_client,
         "chat_client": chat_client,
     }
     try:
@@ -112,6 +127,18 @@ async def run_campaign(
                 await cost.flush_to_db(conn, str(campaign_id))
         except Exception as e:
             print(f"[runner] WARNING: cost flush failed: {e!r}")
+        # Cross-version regression detection (ARCHITECTURE §6): for every
+        # FAIL in this campaign whose case_id last PASSed on a different
+        # target_version, insert a cross_regressions row. Same failure
+        # discipline as cost flush — log + continue, never mask the
+        # campaign result.
+        try:
+            async with connection(cfg) as conn:
+                n_inserted = await detect_for_campaign(conn, campaign_id)
+            if n_inserted:
+                print(f"[runner] cross-regression detection: {n_inserted} new event(s)")
+        except Exception as e:
+            print(f"[runner] WARNING: cross-regression detection failed: {e!r}")
         return campaign_id
     finally:
         # Drain the asyncpg pool so the CLI exits cleanly instead of

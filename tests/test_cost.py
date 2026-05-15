@@ -57,7 +57,7 @@ def test_record_uses_per_model_pricing() -> None:
 
 def test_unknown_model_records_tokens_but_zero_cost() -> None:
     cost.set_campaign("camp-A")
-    cost.record(_FakeResp(500, 200), "claude-sonnet-4-6")
+    cost.record(_FakeResp(500, 200), "fake-mystery-model-v0")
 
     snap = cost.snapshot("camp-A")
     assert snap["tokens_in"] == 500

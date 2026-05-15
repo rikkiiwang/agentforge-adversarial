@@ -12,19 +12,27 @@ campaign_id parameter through `mutate_case`, `judge_llm`, `class_probe`,
 ContextVars propagate across asyncio tasks automatically, so set-once at
 graph start and read-on-each-record works without signature churn.
 
-Prices are a 2026-05 snapshot of OpenAI's public per-1M-token rates for
-the models the harness uses. Unknown models → cost 0 (still counts tokens).
+Prices are a 2026-05 snapshot of OpenAI's and Anthropic's public per-1M-token
+rates for the models the harness uses. Unknown models → cost 0 (still counts
+tokens).
 """
 from __future__ import annotations
 
 import contextvars
 from typing import Any
 
-# Per-1M-token USD prices (OpenAI public list, 2026-05 snapshot).
+# Per-1M-token USD prices (provider public lists, 2026-05 snapshot).
+# Add new models here when introduced; unknown models are still token-counted
+# but priced at 0 (visible in the rollup as a tokens-without-cost discrepancy).
 _PRICE_PER_1M: dict[str, dict[str, float]] = {
+    # OpenAI (Judge default + legacy mutator)
     "gpt-4o-mini":  {"in": 0.15, "out": 0.60},
     "gpt-4o":       {"in": 2.50, "out": 10.00},
     "gpt-4.1-mini": {"in": 0.40, "out": 1.60},
+    # Anthropic (Red Team default; family-split per ARCHITECTURE §2)
+    "claude-haiku-4-5-20251001": {"in": 1.00, "out": 5.00},
+    "claude-sonnet-4-6":         {"in": 3.00, "out": 15.00},
+    "claude-opus-4-7":           {"in": 15.00, "out": 75.00},
 }
 
 _current_campaign_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
@@ -49,25 +57,38 @@ def set_campaign(campaign_id: str) -> None:
 def record(resp: Any, model: str) -> None:
     """Capture token usage + computed cost from an OpenAI chat completion.
 
+    Kept for the Judge call sites that still pass the raw OpenAI response.
+    Provider-agnostic call sites (mutator, class_probe) use
+    ``record_usage`` instead so they don't need to know SDK shapes.
+
     Safe to call from any task — no-op when no campaign is set or the
     response has no usage data (e.g. a mocked client in tests).
     """
-    cid = _current_campaign_id.get()
-    if cid is None:
-        return
     usage = getattr(resp, "usage", None)
     if usage is None:
         return
     pin = int(getattr(usage, "prompt_tokens", 0) or 0)
     pout = int(getattr(usage, "completion_tokens", 0) or 0)
+    record_usage(pin, pout, model)
+
+
+def record_usage(tokens_in: int, tokens_out: int, model: str) -> None:
+    """Capture pre-extracted token usage. Provider-agnostic entry point —
+    callers using ``llm.chat_json`` already get back ``(tokens_in,
+    tokens_out)`` so they don't need to know whether the underlying SDK was
+    OpenAI or Anthropic.
+    """
+    cid = _current_campaign_id.get()
+    if cid is None:
+        return
     rate = _PRICE_PER_1M.get(model, {"in": 0.0, "out": 0.0})
-    cost = (pin * rate["in"] + pout * rate["out"]) / 1_000_000.0
+    cost = (tokens_in * rate["in"] + tokens_out * rate["out"]) / 1_000_000.0
     b = _buffer.setdefault(
         cid, {"cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0, "calls": 0}
     )
     b["cost_usd"] += cost
-    b["tokens_in"] += pin
-    b["tokens_out"] += pout
+    b["tokens_in"] += tokens_in
+    b["tokens_out"] += tokens_out
     b["calls"] += 1
 
 

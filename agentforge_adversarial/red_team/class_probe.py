@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import json
 
+from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ValidationError
 
 from agentforge_adversarial import cost
-from agentforge_adversarial.llm import MUTATOR_MODEL
+from agentforge_adversarial.llm import MUTATOR_MODEL, chat_json
 from agentforge_adversarial.models import AttackRun, EvalCase
 from agentforge_adversarial.red_team.mutator import _format_history_hint
 
@@ -59,7 +60,7 @@ class _ClassProbeOutput(BaseModel):
 
 
 async def generate_boundary_variants(
-    client: AsyncOpenAI,
+    client: AsyncOpenAI | AsyncAnthropic,
     failing_run: AttackRun,
     *,
     n: int = CLASS_PROBE_VARIANT_COUNT,
@@ -86,19 +87,15 @@ async def generate_boundary_variants(
     history_hint = _format_history_hint(history, failing_run.category)
     system_prompt = SYSTEM_PROMPT.replace("{N}", str(n)) + history_hint
     try:
-        resp = await client.chat.completions.create(
-            model=MUTATOR_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_msg},
-            ],
-            response_format={"type": "json_object"},
+        raw, tokens_in, tokens_out = await chat_json(
+            client,
+            MUTATOR_MODEL,
+            system=system_prompt,
+            user=user_msg,
             temperature=0.9,
         )
-        cost.record(resp, MUTATOR_MODEL)
-        parsed = _ClassProbeOutput.model_validate(
-            json.loads(resp.choices[0].message.content or "{}")
-        )
+        cost.record_usage(tokens_in, tokens_out, MUTATOR_MODEL)
+        parsed = _ClassProbeOutput.model_validate(raw)
     except (ValidationError, json.JSONDecodeError):
         return []
     except Exception:
