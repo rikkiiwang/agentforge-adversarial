@@ -20,11 +20,11 @@ would.
 | `THREAT_MODEL.md` | Structured attack-surface taxonomy — 9 categories, OWASP / MITRE ATLAS cross-references. **Hard-gate deliverable.** |
 | `USERS.md` | Target user of *this* platform (security engineer / red-team operator) and the workflows it supports. |
 | `IMPLEMENTATION.md` | Implementation status as of submission — per-component MVP coverage matrix, live verification results, prioritized gap to final submission. |
-| `agentforge_adversarial/` | MVP source — runner, queue, target client, Judge ensemble, Red Team mutator. |
+| `agentforge_adversarial/` | Platform source — LangGraph 7-node state machine (`graph.py`), queue, multi-target factory (`target.py` / `targets.py`), Judge ensemble (`judges/`), Red Team swarm (`red_team/mutator.py` + `class_probe.py`, history-aware), Documentation Agent (`documentation_agent.py`), regression harness (`regression.py`), cost tracker (`cost.py`). |
 | `dashboard/` | Streamlit dashboard reading from Postgres `attack_runs`. |
-| `evals/cases/` | 8 seed YAML test cases (one per shipped category). |
-| `migrations/` | Postgres schema (subset of the canonical design in `docs/components/database-schema.md`). |
-| `tests/` | 28 passing tests (unit + live-Postgres integration). |
+| `evals/cases/` | **32 seed YAML test cases:** 8 hand-curated (one per shipped category) + 15 Garak-derived (`evals/cases/garak/`) + 5 JailbreakBench (`evals/cases/jailbreakbench/`) + 4 HouYi indirect-injection (`evals/cases/houyi/`). |
+| `migrations/` | Postgres schema, 6 SQL files (001 core → 002 targets → 003 lineage → 004 vuln lifecycle → 005 cost columns → 006 mock target). Subset of `docs/components/database-schema.md`. |
+| `tests/` | **71 passing tests** (unit + live-Postgres integration). Run via `.venv/bin/pytest -q`. |
 | `docs/agents/` | Per-agent detailed design (Orchestrator, Red Team swarm, Judge, Documentation). |
 | `docs/components/` | Detailed design for non-agent components (synthesis pipeline, queues, regression harness, schema, dashboard, observability). |
 | `docs/taxonomy/` | One file per attack category — quality bars, channels, defenses tested, seed attack examples. |
@@ -81,7 +81,7 @@ Streamlit dashboard.
 
 | Component | MVP coverage |
 |---|---|
-| Postgres `campaigns` / `attack_queue` / `attack_runs` | ✅ subset of `docs/components/database-schema.md` (3 of 9 designed tables); atomic CHECK + DEFERRABLE FK enforced |
+| Postgres schema | ✅ **6 of ~10 designed tables**: `campaigns` (with `total_cost_usd / total_tokens_in / total_tokens_out` cost columns), `attack_queue`, `attack_runs` (with `parent_id` / `round_num` lineage), `targets`, `vulnerabilities`, `vuln_reports`. Atomic CHECK + DEFERRABLE FK enforced. **Missing for final:** `near_misses`, `cross_regressions`, `threat_model_cells`, `cost_rollup_daily` view, `regression_schedule` (per `docs/components/database-schema.md`). |
 | Dispatcher INSERTs / Judge UPDATEs with atomic CHECK | ✅ two-phase write enforced by `attack_runs_judge_atomic` |
 | Attack-category coverage | ✅ **8 of 9** — Prompt Injection · Data Exfiltration · Tool Misuse · State Corruption · Identity & Role · DoS & Cost · Observability Leak ⭐ · Verification-Gate Bypass ⭐. Deferred: Multimodal & Document Poisoning (needs `/v1/documents/attach` channel, not `/v1/chat`) |
 | Keyword Judge | ✅ category-specific marker sets + DoS length predicate (response > 2000 chars) |
