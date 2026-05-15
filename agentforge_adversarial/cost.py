@@ -33,6 +33,11 @@ _PRICE_PER_1M: dict[str, dict[str, float]] = {
     "claude-haiku-4-5-20251001": {"in": 1.00, "out": 5.00},
     "claude-sonnet-4-6":         {"in": 3.00, "out": 15.00},
     "claude-opus-4-7":           {"in": 15.00, "out": 75.00},
+    # OpenAI embeddings (used by synthesize_fn for dedup + novelty). The
+    # "out" rate is 0 because embedding responses bill only on input
+    # tokens; record_usage gets both fields so the call site stays uniform.
+    "text-embedding-3-small": {"in": 0.02, "out": 0.0},
+    "text-embedding-3-large": {"in": 0.13, "out": 0.0},
 }
 
 _current_campaign_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(

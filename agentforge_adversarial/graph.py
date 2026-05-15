@@ -98,7 +98,8 @@ class CampaignState(TypedDict, total=False):
     mutate: bool
     mutations_per_seed: int
     max_rounds: int
-    openai_client: AsyncOpenAI | None  # Judge family
+    synthesis_k: int  # cap on mutator output after synthesize_fn; 0 disables
+    openai_client: AsyncOpenAI | None  # Judge family + synthesis embeddings
     red_team_client: Any | None  # Red Team family (Anthropic by default)
     chat_client: ChatClient
 
@@ -126,6 +127,22 @@ async def load_seeds_node(state: CampaignState) -> dict[str, Any]:
             target_id=state["target_row"]["id"],
         )
         entries = await enqueue_cases(conn, campaign_id, seeds)
+        # Orchestrator scoring (ARCHITECTURE §2, §4 step 2): compute the
+        # 5-signal weighted score per cell and stash the audit brief on
+        # the campaigns row. Advisory in MVP — doesn't restrict this
+        # campaign's seeds, just records "why now / which cell" so
+        # reviewers can answer that question from one DB row.
+        try:
+            from agentforge_adversarial.orchestrator import emit_brief_for_campaign
+            brief = await emit_brief_for_campaign(conn, campaign_id)
+            if brief is not None:
+                print(
+                    f"[orchestrator] top cell: {brief.chosen_category} / "
+                    f"{brief.chosen_subcategory} ({brief.chosen_channel}) "
+                    f"score={brief.chosen_score:.3f}"
+                )
+        except Exception as e:
+            print(f"[orchestrator] WARNING: brief generation failed: {e!r}")
     cost.set_campaign(str(campaign_id))
     print(f"[graph:load_seeds] campaign {campaign_id}, enqueued {len(entries)} seeds")
     print(f"[campaign] created {campaign_id} (target_version={state['target_version']})")
@@ -181,6 +198,35 @@ async def mutate_node(state: CampaignState) -> dict[str, Any]:
     print(f"[graph:mutate] produced {len(extras)} mutations across {len(seeds_entries)} seeds")
     if not extras:
         return {}
+
+    # synthesize_fn (ARCHITECTURE §4 step 4): filter the noisy mutator
+    # stream down to K high-value attacks. Skipped (passes everything
+    # through unchanged) when no OpenAI key — the pipeline needs the
+    # embeddings API for dedup + novelty.
+    openai_client = state.get("openai_client")
+    if openai_client is not None:
+        from agentforge_adversarial.synthesis import DEFAULT_K, synthesize
+        before = len(extras)
+        try:
+            async with connection(cfg) as conn:
+                extras = await synthesize(
+                    extras,
+                    embed_client=openai_client,
+                    conn=conn,
+                    k=int(state.get("synthesis_k", DEFAULT_K)),
+                )
+            print(
+                f"[graph:mutate] synthesize: {before} → {len(extras)} "
+                f"(dedup + novelty + top-K, K={state.get('synthesis_k', DEFAULT_K)})"
+            )
+        except Exception as e:
+            print(f"[graph:mutate] WARNING: synthesize failed ({type(e).__name__}); "
+                  f"passing {before} candidates through unfiltered: {e!r}")
+    else:
+        print("[graph:mutate] synthesize skipped (no OpenAI key for embeddings)")
+    if not extras:
+        return {}
+
     async with connection(cfg) as conn:
         mut_entries = await enqueue_cases(
             conn,
