@@ -66,6 +66,36 @@ async def get_default_target(conn: asyncpg.Connection) -> dict[str, Any] | None:
     return _row_to_dict(row) if row else None
 
 
+async def patch_target_config(
+    conn: asyncpg.Connection,
+    target_id: UUID,
+    patch: dict[str, Any],
+) -> None:
+    """Merge ``patch`` into a target's ``config_json`` (last-write-wins per key).
+
+    Used by ``run_campaign``'s auto-pick step to persist a discovered
+    patient_id so subsequent campaigns reuse it without re-fetching.
+    Uses the same merge pattern as the ``update-target`` CLI in
+    ``__main__.py`` — read current config, dict-update, write back.
+    """
+    if not patch:
+        return
+    row = await conn.fetchrow(
+        "SELECT config_json FROM targets WHERE id = $1", target_id
+    )
+    if row is None:
+        return
+    current = row["config_json"]
+    if isinstance(current, str):
+        current = json.loads(current)
+    merged = dict(current or {})
+    merged.update(patch)
+    await conn.execute(
+        "UPDATE targets SET config_json = $1::jsonb WHERE id = $2",
+        json.dumps(merged), target_id,
+    )
+
+
 async def add_target(
     conn: asyncpg.Connection,
     *,

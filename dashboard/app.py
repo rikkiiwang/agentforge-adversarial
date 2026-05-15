@@ -884,12 +884,11 @@ with tab_launch:
         if target["target_type"] == "copilot":
             pid_val = (target.get("config_json") or {}).get("patient_id") or ""
             if not pid_val:
-                st.warning(
-                    "⚠️ Co-Pilot target needs `patient_id` configured. "
-                    "Recreate it via '+ Add a new target' below with the "
-                    "patient_id field filled."
+                st.info(
+                    "ℹ️ Co-Pilot target has no `patient_id` yet — the runner "
+                    "will auto-pick one from the target's `/v1/patients` "
+                    "endpoint on first launch and persist it to this row."
                 )
-                ready = False
 
         sw_review = st.checkbox(
             "Review before dispatch (Approve / Modify / Override gate)",

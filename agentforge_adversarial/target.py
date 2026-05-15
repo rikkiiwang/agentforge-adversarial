@@ -16,6 +16,42 @@ class ChatClient(Protocol):
     async def chat(self, prompt: str) -> str: ...
 
 
+async def auto_pick_patient_id(
+    target_url: str,
+    *,
+    physician_user_id: str | None = None,
+    timeout_seconds: float = 5.0,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> str | None:
+    """Fetch the first available Patient UUID from the target's /v1/patients endpoint.
+
+    Used by ``run_campaign`` to remove the manual UUID copy step on first
+    launch against the deployed Co-Pilot. Best-effort: any error (network,
+    non-200, missing endpoint, empty list) returns None and the caller
+    falls back to the env-var / CLI hint path. The ``transport`` argument
+    is a test seam — production calls leave it None.
+    """
+    base = target_url.rstrip("/")
+    params: dict[str, str] = {"limit": "1"}
+    if physician_user_id:
+        params["physician_user_id"] = physician_user_id
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout_seconds, transport=transport
+        ) as client:
+            r = await client.get(f"{base}/v1/patients", params=params)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+    except Exception:
+        return None
+    patients = (data or {}).get("patients") or []
+    if not patients:
+        return None
+    pid = patients[0].get("id")
+    return pid if isinstance(pid, str) and pid else None
+
+
 def make_client(target_row: dict[str, Any]) -> ChatClient:
     """Factory: builds a ChatClient from a `targets` table row.
 
