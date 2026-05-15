@@ -6,7 +6,7 @@ from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ValidationError
 
-from agentforge_adversarial import cost
+from agentforge_adversarial import cost, observability
 from agentforge_adversarial.llm import MUTATOR_MODEL, chat_json
 from agentforge_adversarial.models import EvalCase
 
@@ -114,6 +114,14 @@ async def mutate_case(
             temperature=0.9,
         )
         cost.record_usage(tokens_in, tokens_out, MUTATOR_MODEL)
+        observability.record_generation(
+            model=MUTATOR_MODEL,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            input_summary=f"seed={seed.id} category={seed.category}",
+            output_summary=f"{len(raw.get('mutations', []))} mutations",
+            metadata={"seed_id": seed.id, "n_requested": n},
+        )
         parsed = _MutatorOutput.model_validate(raw)
     except (ValidationError, json.JSONDecodeError):
         return []

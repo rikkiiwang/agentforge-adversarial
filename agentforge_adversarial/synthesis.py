@@ -44,7 +44,7 @@ from uuid import UUID
 import asyncpg
 from openai import AsyncOpenAI
 
-from agentforge_adversarial import cost
+from agentforge_adversarial import cost, observability
 from agentforge_adversarial.models import EvalCase
 
 
@@ -117,11 +117,14 @@ async def embed_batch(
         return []
     resp = await client.embeddings.create(model=model, input=texts)
     usage = getattr(resp, "usage", None)
-    if usage is not None:
-        cost.record_usage(
-            int(getattr(usage, "prompt_tokens", 0) or 0),
-            0,  # embedding responses bill only on input tokens
-            model,
+    tokens_in = int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0
+    if tokens_in:
+        cost.record_usage(tokens_in, 0, model)
+        observability.record_generation(
+            model=model,
+            tokens_in=tokens_in,
+            tokens_out=0,
+            input_summary=f"{len(texts)} text(s)",
         )
     return [d.embedding for d in resp.data]
 
