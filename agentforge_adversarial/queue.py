@@ -29,6 +29,67 @@ async def create_campaign(
     return row["id"]
 
 
+async def enqueue_regression(
+    conn: asyncpg.Connection,
+    campaign_id: UUID,
+    vuln_rows: list[dict],
+    *,
+    red_team_subagent_id: str = "regression-harness-0",
+) -> list[QueueEntry]:
+    """Enqueue regression replays into ``attack_queue`` with source='regression'.
+
+    Each ``vuln_row`` dict carries the originating vulnerability's
+    ``attack_run_id``, ``case_id``, ``category``, ``subcategory``, and
+    ``attack_prompt`` (the prompt that originally caused the FAIL). The
+    queue entry's ``parent_id`` is set to the original attack_run.id so
+    post-judge code can find the linked vulnerability via the same
+    lineage chain class-probe uses.
+
+    Returns the inserted QueueEntry objects so the caller can correlate
+    them with the resulting attack_runs after dispatch.
+    """
+    out: list[QueueEntry] = []
+    for v in vuln_rows:
+        entry = QueueEntry(
+            campaign_id=campaign_id,
+            case_id=v["case_id"],
+            source="regression",
+            category=v["category"],
+            subcategory=v["subcategory"],
+            channel="chat",
+            attack_prompt=v["attack_prompt"],
+            expected_failure_mode=v.get("expected_failure_mode", ""),
+            red_team_subagent_id=red_team_subagent_id,
+            red_team_model="-",
+            parent_id=v["attack_run_id"],
+            round_num=0,
+        )
+        await conn.execute(
+            """
+            INSERT INTO attack_queue (
+              id, campaign_id, source, category, subcategory, channel,
+              attack_prompt, red_team_subagent_id, red_team_model,
+              expected_failure_mode, priority_score, parent_id, round_num
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            """,
+            entry.id,
+            entry.campaign_id,
+            entry.source,
+            entry.category,
+            entry.subcategory,
+            entry.channel,
+            entry.attack_prompt,
+            entry.red_team_subagent_id,
+            entry.red_team_model,
+            entry.expected_failure_mode,
+            entry.priority_score,
+            entry.parent_id,
+            entry.round_num,
+        )
+        out.append(entry)
+    return out
+
+
 async def enqueue_cases(
     conn: asyncpg.Connection,
     campaign_id: UUID,

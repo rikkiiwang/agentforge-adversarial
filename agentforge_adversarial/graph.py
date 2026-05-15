@@ -43,6 +43,7 @@ from agentforge_adversarial.judges.ensemble import (
 )
 from agentforge_adversarial.llm import MUTATOR_MODEL
 from agentforge_adversarial.models import AttackRun, QueueEntry
+from agentforge_adversarial.near_miss import record_near_miss
 from agentforge_adversarial import cost
 from agentforge_adversarial.queue import create_campaign, enqueue_cases
 from agentforge_adversarial.red_team.class_probe import (
@@ -97,7 +98,8 @@ class CampaignState(TypedDict, total=False):
     mutate: bool
     mutations_per_seed: int
     max_rounds: int
-    openai_client: AsyncOpenAI | None
+    openai_client: AsyncOpenAI | None  # Judge family
+    red_team_client: Any | None  # Red Team family (Anthropic by default)
     chat_client: ChatClient
 
     # Mutable graph-internal state.
@@ -137,18 +139,21 @@ async def load_seeds_node(state: CampaignState) -> dict[str, Any]:
 
 
 async def mutate_node(state: CampaignState) -> dict[str, Any]:
-    """Produce 3 LLM mutations per seed. Skipped if mutate=False or no LLM key."""
-    if not state.get("mutate") or state.get("openai_client") is None:
-        print("[graph:mutate] skipped (mutate=False or no OPENAI_API_KEY)")
+    """Produce 3 LLM mutations per seed. Skipped if mutate=False or no Red Team key."""
+    red_team_client = state.get("red_team_client")
+    if not state.get("mutate") or red_team_client is None:
+        print(
+            "[graph:mutate] skipped (mutate=False or no Red Team API key — "
+            "set ANTHROPIC_API_KEY for the default MUTATOR_MODEL)"
+        )
         return {}
     cfg = state["cfg"]
     seeds_entries = state.get("pending") or []
     seed_cases = load_cases(state["cases_path"])
     by_case_id = {c.id: c for c in seed_cases}
-    openai_client = state["openai_client"]
     # Sequential `for await` made the mutator dominate wall-clock time
-    # (8 seeds × ~4s per OpenAI call = 32s before any dispatch). Parallelize
-    # under a Semaphore so we stay under OpenAI rate limits.
+    # (8 seeds × ~4s per Red Team call = 32s before any dispatch). Parallelize
+    # under a Semaphore so we stay under provider rate limits.
     sem = asyncio.Semaphore(LLM_CONCURRENCY)
 
     n_per_seed = int(state.get("mutations_per_seed", 3))
@@ -158,7 +163,7 @@ async def mutate_node(state: CampaignState) -> dict[str, Any]:
         if seed is None:
             return []
         async with sem:
-            return await mutate_case(openai_client, seed, n=n_per_seed)
+            return await mutate_case(red_team_client, seed, n=n_per_seed)
 
     print(
         f"[graph:mutate] generating {n_per_seed} mutations/seed for "
@@ -242,6 +247,16 @@ async def judge_node(state: CampaignState) -> dict[str, Any]:
                     print(f"[graph:judge] WARNING: document_fail failed: {e!r}")
             elif verdict.verdict == "partial":
                 partials.append(run)
+                # Promote PARTIAL to a first-class near-miss lifecycle row
+                # so the dashboard's Near-Miss tile (ARCHITECTURE §7) and
+                # the orchestrator's post-verdict routing can act on it.
+                # Idempotent on attack_run_id; safe under judge retry.
+                try:
+                    await record_near_miss(
+                        conn, run, campaign_id=state["campaign_id"]
+                    )
+                except Exception as e:
+                    print(f"[graph:judge] WARNING: record_near_miss failed: {e!r}")
     print(
         f"[graph:judge] judged {len(dispatched)} runs; "
         f"FAIL={len(fails)} PARTIAL={len(partials)}"
@@ -252,12 +267,12 @@ async def judge_node(state: CampaignState) -> dict[str, Any]:
 async def class_probe_node(state: CampaignState) -> dict[str, Any]:
     """For each FAIL this round, fan out 10 boundary variants. Increment round_num."""
     cfg = state["cfg"]
-    openai_client = state.get("openai_client")
+    red_team_client = state.get("red_team_client")
     fails = state.get("fails_this_round") or []
     round_num = state.get("round_num", 0)
     next_round = round_num + 1
-    if openai_client is None or not fails:
-        print(f"[graph:class_probe] no fan-out (no FAILs or no LLM); ending round {next_round}")
+    if red_team_client is None or not fails:
+        print(f"[graph:class_probe] no fan-out (no FAILs or no Red Team key); ending round {next_round}")
         return {"round_num": next_round, "fails_this_round": []}
     history = _build_history(state.get("completed"))
     print(
@@ -270,7 +285,7 @@ async def class_probe_node(state: CampaignState) -> dict[str, Any]:
     async def _probe_one(failing_run):
         async with sem:
             return failing_run, await generate_boundary_variants(
-                openai_client, failing_run, history=history
+                red_team_client, failing_run, history=history
             )
 
     results = await asyncio.gather(
@@ -316,13 +331,13 @@ async def partial_reentry_node(state: CampaignState) -> dict[str, Any]:
     output); the partial-reentry origin is recoverable via parent_id lineage.
     """
     cfg = state["cfg"]
-    openai_client = state.get("openai_client")
+    red_team_client = state.get("red_team_client")
     partials = state.get("partials_this_round") or []
     round_num = state.get("round_num", 0)
     next_round = round_num + 1
-    if openai_client is None or not partials:
+    if red_team_client is None or not partials:
         print(
-            f"[graph:partial_reentry] no fan-out (no PARTIALs or no LLM); "
+            f"[graph:partial_reentry] no fan-out (no PARTIALs or no Red Team key); "
             f"round stays {round_num}"
         )
         return {"partials_this_round": []}
@@ -360,7 +375,7 @@ async def partial_reentry_node(state: CampaignState) -> dict[str, Any]:
             )
         async with sem:
             return partial_run, await mutate_case(
-                openai_client, seed,
+                red_team_client, seed,
                 n=int(state.get("mutations_per_seed", 3)),
                 history=history,
             )

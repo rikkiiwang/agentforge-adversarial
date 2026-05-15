@@ -12,6 +12,7 @@ load_dotenv()
 class Config:
     database_url: str
     openai_api_key: str
+    anthropic_api_key: str
     target_url: str
     target_version: str
     copilot_patient_id: str
@@ -22,6 +23,7 @@ class Config:
         return cls(
             database_url=os.environ["DATABASE_URL"],
             openai_api_key=os.environ.get("OPENAI_API_KEY", ""),
+            anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
             target_url=os.environ.get(
                 "TARGET_URL", "https://copilot-production-b532.up.railway.app"
             ),

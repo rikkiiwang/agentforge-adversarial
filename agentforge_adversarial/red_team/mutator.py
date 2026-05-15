@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 
+from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ValidationError
 
 from agentforge_adversarial import cost
-from agentforge_adversarial.llm import MUTATOR_MODEL
+from agentforge_adversarial.llm import MUTATOR_MODEL, chat_json
 from agentforge_adversarial.models import EvalCase
 
 MUTATOR_SUBAGENT_ID = "red-team-mutator-0"
@@ -77,13 +78,17 @@ class _MutatorOutput(BaseModel):
 
 
 async def mutate_case(
-    client: AsyncOpenAI,
+    client: AsyncOpenAI | AsyncAnthropic,
     seed: EvalCase,
     *,
     n: int = DEFAULT_MUTATIONS_PER_SEED,
     history: list[dict] | None = None,
 ) -> list[EvalCase]:
     """Generate `n` LLM-mutated variants of a seed case.
+
+    `client` is provider-agnostic: pass whichever SDK matches
+    ``MUTATOR_MODEL`` (Anthropic when the model name starts with
+    ``claude``, OpenAI otherwise). ``chat_json`` handles the dispatch.
 
     `history` (optional, set by the graph in rounds 1+) is a list of
     `{"category", "verdict", "attack_prompt"}` dicts from completed
@@ -101,19 +106,15 @@ async def mutate_case(
         f"Produce {n} mutations."
     )
     try:
-        resp = await client.chat.completions.create(
-            model=MUTATOR_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_msg},
-            ],
-            response_format={"type": "json_object"},
+        raw, tokens_in, tokens_out = await chat_json(
+            client,
+            MUTATOR_MODEL,
+            system=system_prompt,
+            user=user_msg,
             temperature=0.9,
         )
-        cost.record(resp, MUTATOR_MODEL)
-        parsed = _MutatorOutput.model_validate(
-            json.loads(resp.choices[0].message.content or "{}")
-        )
+        cost.record_usage(tokens_in, tokens_out, MUTATOR_MODEL)
+        parsed = _MutatorOutput.model_validate(raw)
     except (ValidationError, json.JSONDecodeError):
         return []
     except Exception:

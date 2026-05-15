@@ -1,21 +1,34 @@
 """Regression harness — replay confirmed vulnerabilities against the
-current target version and transition the vuln state machine to
-`fix_validated` (replay PASSes) or `reopened` (replay FAILs again).
+current target version through the same queue → dispatcher → judge path
+the live graph uses. Post-judge, vulnerability state transitions land
+based on the persisted attack_run verdict.
 
-This is a *slim* version of the design in
-`docs/components/regression-harness.md` — single-shot CLI replay, no
-`regression_schedule` table, no cron, no parallelism cap. The pieces it
-*does* implement are the load-bearing ones for the demo:
+ARCHITECTURE.md §4 / §6: "harness enqueues source='regression' rows; the
+dispatcher INSERTs the resulting attack_runs." This module is the
+production code path for that contract. The prior synchronous-replay
+implementation (which never persisted an attack_run for the replay) is
+gone — replay evidence is now first-class.
 
-  - reads each vulnerability's original attack_prompt from `attack_runs`
-  - dispatches the prompt against the *current* target_version
-  - judges the response with the same ensemble Judge the live graph uses
-  - writes the appropriate `vulnerabilities` state transition
+Flow:
 
-The hosted `attack_runs` row from the replay is *not* persisted — we'd
-need a `source='regression'` enum entry to make that clean, and the
-slim version's goal is just to demonstrate the closed-loop fix-validation
-contract. State transitions are the only writes.
+  1. SELECT replayable vulns (state ∈ {triaged, fix_proposed, reopened,
+     optionally closed} AND target_version != current).
+  2. ``queue.enqueue_regression`` inserts one queue entry per vuln with
+     ``source='regression'`` and ``parent_id`` pointing at the original
+     FAIL'd attack_run.
+  3. The dispatcher (``target.dispatch_to_attack_run``) executes the
+     queue entry against the live target and INSERTs an attack_runs row
+     — the same INSERT path as a normal campaign.
+  4. The ensemble Judge (``judges.ensemble.judge_attack_run`` +
+     ``update_attack_run_with_verdict``) UPDATEs the verdict on the
+     inserted row.
+  5. Post-judge: PASS → vulnerability flips to ``fix_validated``;
+     FAIL → ``reopened``; PARTIAL → no transition.
+
+Each step uses the same helpers as the main graph, so the regression
+audit trail (campaigns row, attack_queue row, attack_runs row, judged
+verdict) is structurally identical to a live campaign — the only
+difference is ``attack_runs.source = 'regression'``.
 """
 from __future__ import annotations
 
@@ -28,9 +41,17 @@ from openai import AsyncOpenAI
 
 from agentforge_adversarial.config import Config
 from agentforge_adversarial.db import close_pool, connection
-from agentforge_adversarial.judges.ensemble import judge_attack_run
-from agentforge_adversarial.models import AttackRun
-from agentforge_adversarial.target import ChatClient, make_client
+from agentforge_adversarial.judges.ensemble import (
+    judge_attack_run,
+    update_attack_run_with_verdict,
+)
+from agentforge_adversarial.queue import create_campaign, enqueue_regression
+from agentforge_adversarial.target import (
+    ChatClient,
+    dispatch_to_attack_run,
+    insert_attack_run,
+    make_client,
+)
 from agentforge_adversarial.targets import (
     get_default_target,
     get_target_by_name,
@@ -47,9 +68,10 @@ class RegressionResult:
     category: str
     original_target_version: str
     new_target_version: str
-    new_verdict: str  # 'pass' | 'partial' | 'fail'
-    new_state: str    # 'fix_validated' | 'reopened' | 'no_change'
+    new_verdict: str  # 'pass' | 'partial' | 'fail' | '-' (dry-run)
+    new_state: str    # 'fix_validated' | 'reopened' | 'no_change' | …
     observed_output_truncated: str
+    attack_run_id: str | None = None  # persisted attack_run.id; None on dry-run
 
 
 async def _fetch_replayable_vulns(
@@ -90,52 +112,18 @@ async def _fetch_replayable_vulns(
     return [dict(r) for r in rows]
 
 
-async def replay_vulnerability(
+async def _transition_vuln_after_judge(
     conn: asyncpg.Connection,
     vuln_row: dict[str, Any],
     *,
-    chat_client: ChatClient,
-    openai_client: AsyncOpenAI | None,
+    verdict: str,
     new_target_version: str,
-) -> RegressionResult:
-    """Replay one vulnerability's attack against the current target.
+) -> str:
+    """PASS → fix_validated, FAIL → reopened, PARTIAL → no-op.
 
-    Verdict semantics:
-      - PASS  →   vulnerability flips to `fix_validated`, `closed_at`/
-                  `closed_by` filled.
-      - FAIL  →   vulnerability flips to `reopened`.
-      - PARTIAL → no transition; we treat ambiguous as not-yet-fixed,
-                  and leave the existing state alone to avoid bouncing
-                  the row between states on every replay.
+    Returns the new state (or the unchanged prior state if PARTIAL).
     """
-    observed = await chat_client.chat(vuln_row["attack_prompt"])
-
-    # Build a stub AttackRun so we can reuse the live ensemble Judge.
-    # `id` and `queue_entry_id` are not consulted by the Judge.
-    stub_run = AttackRun(
-        id=UUID(int=0),
-        queue_entry_id=UUID(int=0),
-        campaign_id=UUID(int=0),
-        case_id=vuln_row["case_id"],
-        source="regression",  # informational; not persisted
-        category=vuln_row["category"],
-        subcategory=vuln_row["subcategory"],
-        channel="chat",
-        red_team_subagent_id=REGRESSION_ACTOR,
-        red_team_model="-",
-        attack_prompt=vuln_row["attack_prompt"],
-        expected_failure_mode=vuln_row["expected_failure_mode"],
-        observed_output=observed,
-        target_version=new_target_version,
-        cost_usd=0.0,
-        latency_ms=0,
-        dispatcher_version="regression-0",
-    )
-    result = await judge_attack_run(stub_run, openai_client=openai_client)
-
-    new_state = vuln_row["state"]  # default: no change
-    if result.verdict == "pass":
-        new_state = "fix_validated"
+    if verdict == "pass":
         await conn.execute(
             """
             UPDATE vulnerabilities
@@ -150,8 +138,8 @@ async def replay_vulnerability(
             REGRESSION_ACTOR,
             vuln_row["vuln_id"],
         )
-    elif result.verdict == "fail":
-        new_state = "reopened"
+        return "fix_validated"
+    if verdict == "fail":
         await conn.execute(
             """
             UPDATE vulnerabilities
@@ -163,19 +151,8 @@ async def replay_vulnerability(
             new_target_version,
             vuln_row["vuln_id"],
         )
-    # PARTIAL → no DB write; new_state stays at the previous state.
-
-    return RegressionResult(
-        vuln_id=str(vuln_row["vuln_id"]),
-        case_id=vuln_row["case_id"],
-        category=vuln_row["category"],
-        original_target_version=vuln_row["original_target_version"],
-        new_target_version=new_target_version,
-        new_verdict=result.verdict,
-        new_state=new_state,
-        observed_output_truncated=(observed[:240] + "…")
-        if len(observed) > 240 else observed,
-    )
+        return "reopened"
+    return vuln_row["state"]  # PARTIAL: no change
 
 
 async def regress_all(
@@ -185,11 +162,12 @@ async def regress_all(
     include_closed: bool = False,
     dry_run: bool = False,
 ) -> list[RegressionResult]:
-    """Replay every replayable vulnerability against the current target.
+    """Replay every replayable vulnerability against the current target
+    via the queue-backed evidence path.
 
-    `dry_run=True` skips state transitions (useful for showing the
-    operator what would change). Reuses the live ensemble Judge so the
-    rubric stays identical between attack-time and regression-time
+    ``dry_run=True`` skips both enqueueing and dispatch — it reports
+    which vulns *would* be replayed. Reuses the live ensemble Judge so
+    the rubric stays identical between attack-time and regression-time
     verdicts.
     """
     openai_client = (
@@ -235,10 +213,6 @@ async def _regress_all_inner(
     new_target_version = (
         f"{target_row['target_type']}:{target_row['target_url']}"
     )
-    # Defer building the chat_client until we know we'll actually dispatch
-    # — dry-run reports against the *current* target_version without
-    # touching the network or requiring env vars like COPILOT_PATIENT_ID.
-    chat_client: ChatClient | None = None if dry_run else make_client(target_row)
 
     async with connection(cfg) as conn:
         vulns = await _fetch_replayable_vulns(
@@ -246,14 +220,13 @@ async def _regress_all_inner(
             current_target_version=new_target_version,
             include_closed=include_closed,
         )
-
     if not vulns:
         return []
 
-    results: list[RegressionResult] = []
-    for v in vulns:
-        if dry_run:
-            results.append(RegressionResult(
+    if dry_run:
+        # Same shape as a real run for predictable CLI output, no dispatch.
+        return [
+            RegressionResult(
                 vuln_id=str(v["vuln_id"]),
                 case_id=v["case_id"],
                 category=v["category"],
@@ -262,15 +235,60 @@ async def _regress_all_inner(
                 new_verdict="-",
                 new_state=f"would-replay (current state: {v['state']})",
                 observed_output_truncated="(dry run — not dispatched)",
-            ))
-            continue
+            )
+            for v in vulns
+        ]
+
+    # --- queue-backed dispatch path ---
+    chat_client: ChatClient = make_client(target_row)
+
+    # One regression campaign per invocation gives operators the same
+    # audit trail (campaigns row, attack_queue rows, attack_runs rows)
+    # that a normal campaign produces.
+    async with connection(cfg) as conn:
+        campaign_id = await create_campaign(
+            conn,
+            name="regression-replay",
+            target_version=new_target_version,
+            notes=f"regression-harness replay; {len(vulns)} vuln(s)",
+            target_id=target_row["id"],
+        )
+        queue_entries = await enqueue_regression(
+            conn, campaign_id, vulns,
+            red_team_subagent_id=REGRESSION_ACTOR,
+        )
+
+    # Pair each queue entry with its vuln_row by index (1:1, same order).
+    by_entry_id = {e.id: vulns[i] for i, e in enumerate(queue_entries)}
+
+    results: list[RegressionResult] = []
+    for entry in queue_entries:
+        vuln_row = by_entry_id[entry.id]
+        # Dispatch — same helper the live graph uses. INSERTs attack_runs.
+        run = await dispatch_to_attack_run(entry, chat_client, new_target_version)
         async with connection(cfg) as conn:
-            assert chat_client is not None  # dry_run handled above
-            res = await replay_vulnerability(
-                conn, v,
-                chat_client=chat_client,
-                openai_client=openai_client,
+            await insert_attack_run(conn, run)
+            # Judge — same ensemble the live graph uses. UPDATEs attack_runs.
+            verdict = await judge_attack_run(run, openai_client=openai_client)
+            await update_attack_run_with_verdict(conn, run.id, verdict)
+            # Post-judge: transition the originating vulnerability.
+            new_state = await _transition_vuln_after_judge(
+                conn, vuln_row,
+                verdict=verdict.verdict,
                 new_target_version=new_target_version,
             )
-        results.append(res)
+
+        observed = run.observed_output
+        results.append(RegressionResult(
+            vuln_id=str(vuln_row["vuln_id"]),
+            case_id=vuln_row["case_id"],
+            category=vuln_row["category"],
+            original_target_version=vuln_row["original_target_version"],
+            new_target_version=new_target_version,
+            new_verdict=verdict.verdict,
+            new_state=new_state,
+            observed_output_truncated=(observed[:240] + "…")
+            if len(observed) > 240 else observed,
+            attack_run_id=str(run.id),
+        ))
     return results
