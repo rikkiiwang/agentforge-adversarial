@@ -19,7 +19,7 @@ from openai import AsyncOpenAI
 from agentforge_adversarial.config import Config
 from agentforge_adversarial.cross_regression import detect_for_campaign
 from agentforge_adversarial.db import close_pool, connection
-from agentforge_adversarial import cost
+from agentforge_adversarial import cost, observability
 from agentforge_adversarial.graph import MAX_ROUNDS_DEFAULT, build_graph
 from agentforge_adversarial.llm import MUTATOR_MODEL, is_anthropic_model
 from agentforge_adversarial.target import ChatClient, auto_pick_patient_id, make_client
@@ -141,6 +141,13 @@ async def run_campaign(
             print(f"[runner] WARNING: cross-regression detection failed: {e!r}")
         return campaign_id
     finally:
+        # Flush Langfuse buffer first — events ship before any of the
+        # later teardown steps can interfere. No-op when tracing is
+        # disabled (no LANGFUSE_* env keys).
+        try:
+            observability.flush()
+        except Exception as e:
+            print(f"[runner] WARNING: langfuse flush failed: {e!r}")
         # Drain the asyncpg pool so the CLI exits cleanly instead of
         # blocking ~10s on keepalive tasks. Wrapped in try/except so a
         # pool-close failure can't mask the campaign's primary result.

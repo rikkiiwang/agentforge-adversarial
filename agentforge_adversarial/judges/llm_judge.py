@@ -5,7 +5,7 @@ import json
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ValidationError
 
-from agentforge_adversarial import cost
+from agentforge_adversarial import cost, observability
 from agentforge_adversarial.llm import JUDGE_MODEL
 from agentforge_adversarial.models import JudgeResult
 
@@ -72,6 +72,14 @@ async def judge_llm(
             temperature=0.0,
         )
         cost.record(resp, JUDGE_MODEL)
+        usage = getattr(resp, "usage", None)
+        observability.record_generation(
+            model=JUDGE_MODEL,
+            tokens_in=int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0,
+            tokens_out=int(getattr(usage, "completion_tokens", 0) or 0) if usage else 0,
+            input_summary=f"category={category}",
+            output_summary=resp.choices[0].message.content[:200] if resp.choices else None,
+        )
         raw = json.loads(resp.choices[0].message.content or "{}")
         parsed = _LlmJudgeRaw.model_validate(raw)
     except (ValidationError, json.JSONDecodeError, Exception) as e:

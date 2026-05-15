@@ -13,6 +13,9 @@ class Config:
     database_url: str
     openai_api_key: str
     anthropic_api_key: str
+    langfuse_public_key: str
+    langfuse_secret_key: str
+    langfuse_base_url: str
     target_url: str
     target_version: str
     copilot_patient_id: str
@@ -24,6 +27,11 @@ class Config:
             database_url=os.environ["DATABASE_URL"],
             openai_api_key=os.environ.get("OPENAI_API_KEY", ""),
             anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
+            langfuse_public_key=os.environ.get("LANGFUSE_PUBLIC_KEY", ""),
+            langfuse_secret_key=os.environ.get("LANGFUSE_SECRET_KEY", ""),
+            langfuse_base_url=os.environ.get(
+                "LANGFUSE_BASE_URL", "https://cloud.langfuse.com"
+            ),
             target_url=os.environ.get(
                 "TARGET_URL", "https://copilot-production-b532.up.railway.app"
             ),

@@ -44,7 +44,7 @@ from agentforge_adversarial.judges.ensemble import (
 from agentforge_adversarial.llm import MUTATOR_MODEL
 from agentforge_adversarial.models import AttackRun, QueueEntry
 from agentforge_adversarial.near_miss import record_near_miss
-from agentforge_adversarial import cost
+from agentforge_adversarial import cost, observability
 from agentforge_adversarial.queue import create_campaign, enqueue_cases
 from agentforge_adversarial.red_team.class_probe import (
     CLASS_PROBE_SUBAGENT_ID,
@@ -127,6 +127,24 @@ async def load_seeds_node(state: CampaignState) -> dict[str, Any]:
             target_id=state["target_row"]["id"],
         )
         entries = await enqueue_cases(conn, campaign_id, seeds)
+        # Langfuse trace (ARCHITECTURE §5): start the top-level trace
+        # now so every subsequent node's span nests under it. Persists
+        # the trace id on campaigns so the dashboard can deep-link.
+        # No-op when LANGFUSE_* keys are absent.
+        try:
+            trace_id = observability.start_campaign_trace(
+                campaign_id=campaign_id,
+                target_version=state["target_version"],
+                cases_path=str(cases_path),
+            )
+            if trace_id:
+                await conn.execute(
+                    "UPDATE campaigns SET langfuse_trace_id = $1 WHERE id = $2",
+                    trace_id, campaign_id,
+                )
+                print(f"[langfuse] trace_id={trace_id}")
+        except Exception as e:
+            print(f"[langfuse] WARNING: start_campaign_trace failed: {e!r}")
         # Orchestrator scoring (ARCHITECTURE §2, §4 step 2): compute the
         # 5-signal weighted score per cell and stash the audit brief on
         # the campaigns row. Advisory in MVP — doesn't restrict this
@@ -134,13 +152,18 @@ async def load_seeds_node(state: CampaignState) -> dict[str, Any]:
         # reviewers can answer that question from one DB row.
         try:
             from agentforge_adversarial.orchestrator import emit_brief_for_campaign
-            brief = await emit_brief_for_campaign(conn, campaign_id)
-            if brief is not None:
-                print(
-                    f"[orchestrator] top cell: {brief.chosen_category} / "
-                    f"{brief.chosen_subcategory} ({brief.chosen_channel}) "
-                    f"score={brief.chosen_score:.3f}"
-                )
+            with observability.span("orchestrator"):
+                brief = await emit_brief_for_campaign(conn, campaign_id)
+                if brief is not None:
+                    print(
+                        f"[orchestrator] top cell: {brief.chosen_category} / "
+                        f"{brief.chosen_subcategory} ({brief.chosen_channel}) "
+                        f"score={brief.chosen_score:.3f}"
+                    )
+                    observability.annotate_current_span(
+                        output=f"top={brief.chosen_category}/{brief.chosen_subcategory} score={brief.chosen_score:.3f}",
+                        metadata={"weights": brief.weights, "n_cells": len(brief.cells)},
+                    )
         except Exception as e:
             print(f"[orchestrator] WARNING: brief generation failed: {e!r}")
     cost.set_campaign(str(campaign_id))
@@ -157,6 +180,11 @@ async def load_seeds_node(state: CampaignState) -> dict[str, Any]:
 
 async def mutate_node(state: CampaignState) -> dict[str, Any]:
     """Produce 3 LLM mutations per seed. Skipped if mutate=False or no Red Team key."""
+    with observability.span("red_team_mutator") as _sp:
+        return await _mutate_node_impl(state)
+
+
+async def _mutate_node_impl(state: CampaignState) -> dict[str, Any]:
     red_team_client = state.get("red_team_client")
     if not state.get("mutate") or red_team_client is None:
         print(
@@ -199,6 +227,10 @@ async def mutate_node(state: CampaignState) -> dict[str, Any]:
     if not extras:
         return {}
 
+    observability.annotate_current_span(
+        output=f"produced {len(extras)} mutations from {len(seeds_entries)} seeds",
+    )
+
     # synthesize_fn (ARCHITECTURE §4 step 4): filter the noisy mutator
     # stream down to K high-value attacks. Skipped (passes everything
     # through unchanged) when no OpenAI key — the pipeline needs the
@@ -208,12 +240,17 @@ async def mutate_node(state: CampaignState) -> dict[str, Any]:
         from agentforge_adversarial.synthesis import DEFAULT_K, synthesize
         before = len(extras)
         try:
-            async with connection(cfg) as conn:
-                extras = await synthesize(
-                    extras,
-                    embed_client=openai_client,
-                    conn=conn,
-                    k=int(state.get("synthesis_k", DEFAULT_K)),
+            with observability.span("synthesize") as _sp:
+                async with connection(cfg) as conn:
+                    extras = await synthesize(
+                        extras,
+                        embed_client=openai_client,
+                        conn=conn,
+                        k=int(state.get("synthesis_k", DEFAULT_K)),
+                    )
+                observability.annotate_current_span(
+                    output=f"{before} → {len(extras)}",
+                    metadata={"k": int(state.get("synthesis_k", DEFAULT_K))},
                 )
             print(
                 f"[graph:mutate] synthesize: {before} → {len(extras)} "
@@ -243,19 +280,24 @@ async def mutate_node(state: CampaignState) -> dict[str, Any]:
 
 async def dispatch_node(state: CampaignState) -> dict[str, Any]:
     """Dispatch every QueueEntry in `pending` against the chat_client."""
-    cfg = state["cfg"]
-    chat_client = state["chat_client"]
-    target_version = state["target_version"]
-    pending = state.get("pending") or []
-    print(f"[graph:dispatch] dispatching {len(pending)} attacks (round={state.get('round_num', 0)})")
-    runs: list[AttackRun] = []
-    async with connection(cfg) as conn:
-        for entry in pending:
-            run = await dispatch_to_attack_run(entry, chat_client, target_version)
-            await insert_attack_run(conn, run)
-            runs.append(run)
-    # `pending` consumed — clear it for the next round.
-    return {"pending": [], "completed": runs, "dispatched_this_round": runs}
+    with observability.span("dispatch") as _sp:
+        cfg = state["cfg"]
+        chat_client = state["chat_client"]
+        target_version = state["target_version"]
+        pending = state.get("pending") or []
+        print(f"[graph:dispatch] dispatching {len(pending)} attacks (round={state.get('round_num', 0)})")
+        runs: list[AttackRun] = []
+        async with connection(cfg) as conn:
+            for entry in pending:
+                run = await dispatch_to_attack_run(entry, chat_client, target_version)
+                await insert_attack_run(conn, run)
+                runs.append(run)
+        observability.annotate_current_span(
+            output=f"dispatched {len(runs)} attack_runs",
+            metadata={"round": state.get("round_num", 0)},
+        )
+        # `pending` consumed — clear it for the next round.
+        return {"pending": [], "completed": runs, "dispatched_this_round": runs}
 
 
 async def judge_node(state: CampaignState) -> dict[str, Any]:
@@ -266,6 +308,16 @@ async def judge_node(state: CampaignState) -> dict[str, Any]:
     enters the mutator (3 fresh phrasings each, aiming to disambiguate the
     ambiguous verdict in the next round).
     """
+    with observability.span("judge") as _sp:
+        result = await _judge_node_impl(state)
+        observability.annotate_current_span(
+            output=f"FAIL={len(result.get('fails_this_round', []))} "
+                   f"PARTIAL={len(result.get('partials_this_round', []))}",
+        )
+        return result
+
+
+async def _judge_node_impl(state: CampaignState) -> dict[str, Any]:
     cfg = state["cfg"]
     openai_client = state.get("openai_client")
     dispatched: list[AttackRun] = state.get("dispatched_this_round") or []
@@ -312,6 +364,11 @@ async def judge_node(state: CampaignState) -> dict[str, Any]:
 
 async def class_probe_node(state: CampaignState) -> dict[str, Any]:
     """For each FAIL this round, fan out 10 boundary variants. Increment round_num."""
+    with observability.span("class_probe") as _sp:
+        return await _class_probe_node_impl(state)
+
+
+async def _class_probe_node_impl(state: CampaignState) -> dict[str, Any]:
     cfg = state["cfg"]
     red_team_client = state.get("red_team_client")
     fails = state.get("fails_this_round") or []
@@ -376,6 +433,11 @@ async def partial_reentry_node(state: CampaignState) -> dict[str, Any]:
     `round_num` = round_num + 1. Source remains 'random' (same as mutator
     output); the partial-reentry origin is recoverable via parent_id lineage.
     """
+    with observability.span("partial_reentry") as _sp:
+        return await _partial_reentry_impl(state)
+
+
+async def _partial_reentry_impl(state: CampaignState) -> dict[str, Any]:
     cfg = state["cfg"]
     red_team_client = state.get("red_team_client")
     partials = state.get("partials_this_round") or []
