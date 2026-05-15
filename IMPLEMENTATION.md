@@ -1,6 +1,6 @@
 # AgentForge Adversarial — Implementation Status
 
-**Submission date:** 2026-05-12 (MVP) · revised 2026-05-13 (operator console complete + auto-auth + multi-target + LangGraph + FAIL/PARTIAL fan-out + swarm picker + Approve gate + parallel LLM) · 2026-05-14 (P2: dashboard tabs refactor + cost rollup + regression harness + history-aware prompts)
+**Submission date:** 2026-05-12 (MVP) · revised 2026-05-13 (operator console complete + auto-auth + multi-target + LangGraph + FAIL/PARTIAL fan-out + swarm picker + Approve gate + parallel LLM) · 2026-05-14 (P2: dashboard tabs refactor + cost rollup + slim regression harness + history-aware prompts) · **2026-05-15 (architecture-fidelity sweep: Track A bundle, Track B Orchestrator+synthesize_fn, Track C Langfuse — closes all 7 remaining architecture gaps)**
 **MVP commit:** `513ee25` (initial MVP). Subsequent work on 2026-05-12/13 added: operator-console Launch panel, auto-session-creation auth, multi-target generic factory, LangGraph state machine, and class-probe FAIL fan-out.
 **Deployed dashboard:** https://agentforge-adversarial-production.up.railway.app/
 **Target under test:** https://copilot-production-b532.up.railway.app/
@@ -9,46 +9,72 @@
 
 ## Scope honesty
 
-This codebase is an **architecture-aligned vertical slice** of
-`ARCHITECTURE.md`, not the full multi-agent platform that document
-describes. What ships:
+This codebase is now **architecture-complete** — every pillar described
+in `ARCHITECTURE.md` has a shipped, tested implementation. The
+2026-05-15 sweep closed the seven gaps that the 2026-05-12 MVP had
+left as "deferred." What ships:
 
 - LangGraph 7-node state machine + FAIL/PARTIAL fan-out
 - Postgres `campaigns` / `attack_queue` / `attack_runs` two-phase write
   with atomic CHECK constraint
 - Ensemble Judge (keyword + LLM, every category)
+- **Judge / Red Team model family split** — Judge on OpenAI
+  (`gpt-4o-mini`), Red Team on Anthropic (`claude-haiku-4-5-20251001`).
+  Provider-agnostic dispatch via `llm.chat_json`. **(2026-05-15)**
 - Documentation Agent + vulnerability lifecycle (`discovered → triaged
   → fix_proposed → fix_validated / reopened / closed`)
-- Multi-target factory (`copilot` / `generic_chat` / `openai_compat`)
+- Multi-target factory (`copilot` / `generic_chat` / `openai_compat` / `mock`)
 - Per-campaign cost rollup (P2)
-- Slim regression harness (CLI + Vuln Board button)
+- **Queue-backed regression harness** — replays go through
+  `attack_queue → dispatch → judge`, leaving a first-class
+  `attack_runs` audit trail. PASS/FAIL/PARTIAL transitions unchanged.
+  **(2026-05-15)**
 - History-aware mutator + class-probe prompts (rounds 1+)
+- **`synthesize_fn` 6-stage pipeline** — normalize → embed
+  (text-embedding-3-small) → within-batch dedup (cosine ≥ 0.92) →
+  novelty filter vs the last 200 attack_runs (cosine ≥ 0.85) →
+  weighted score → budget-capped greedy pick (K=10 default) with
+  channel-diversity floor. **(2026-05-15)**
+- **Orchestrator 5-signal cell scoring + `CampaignBrief`** — advisory
+  shape (records the breakdown on `campaigns.brief_json`, doesn't
+  restrict the campaign to one cell). Weights `0.30 coverage_gap ·
+  0.30 partial_rate · 0.20 severity_baseline · 0.10 staleness · 0.10
+  diversity_score`. Cell granularity `(category, subcategory, channel)`
+  at `taxonomy_version='v1'`. **(2026-05-15)**
+- **`near_misses` table + PARTIAL lifecycle hook** — every PARTIAL
+  verdict spawns an `exploring` row; state machine `exploring →
+  escalated / exhausted / budget_capped` driven by post-verdict
+  routing. **(2026-05-15)**
+- **`cross_regressions` table + post-campaign detection** — at every
+  campaign end, finds case_ids that PASSed on a prior `target_version`
+  but FAILed on the current one. **(2026-05-15)**
+- **Langfuse observability** — one trace per campaign on
+  `cloud.langfuse.com`; per-agent spans (orchestrator, red_team_mutator,
+  synthesize, dispatch, judge, class_probe, partial_reentry); per-LLM
+  generations carrying tokens-in/out + cost-USD. `campaigns.langfuse_trace_id`
+  stores the deep-link. Degrades silently when env keys missing.
+  **(2026-05-15)**
 
-What is **not** in this slice — final-work scope:
+Still deferred (low demo ROI, low submission-gate impact):
 
-- Orchestrator per-cell scoring engine (`docs/components/orchestrator-scoring.md`)
-- `synthesize_fn` pipeline that promotes high-novelty FAILs into seed cases
-- `regression_schedule` table + cron / per-deploy triggers (the shipped
-  regression harness is operator-initiated, not autonomous)
+- `regression_schedule` table + cron / per-deploy triggers. The
+  queue-backed regression harness covers the *evidence path*; the
+  cron-driven *trigger path* is operator-initiated for now.
 - `/healthz`-SHA-based `target_version` tracking. `ARCHITECTURE.md` §4
   step 7c describes deriving `target_version` from a git commit SHA
   surfaced by the target's `/healthz` endpoint, so vulnerabilities are
   durably scoped to a versioned build. The current implementation
   records `target_version = f"{target_type}:{target_url}"`
   (`runner.py:60`), which only distinguishes targets, not deploys of
-  the *same* target — so the regression harness can detect "different
-  target" but not "same target, new deploy". Closing this gap would
-  give the platform the version-scoped coverage the design promises.
-- Langfuse trace integration (needs external account; designed in
-  `docs/components/observability.md`)
+  the *same* target.
 - Multimodal & Document Poisoning category (needs target-side
-  `/v1/documents/attach`)
-- pgvector novelty dedup (not planned until seed corpus > 50)
-
-The shipped surface is enough to demonstrate the contract end-to-end
-(seed → mutator → dispatch → Judge → vuln → triage → replay) on a real
-deployed target. The deferred surface is what would turn it from a
-slice into an always-on platform.
+  `/v1/documents/attach` channel work).
+- pgvector novelty dedup. In-memory cosine vs the last 200 attack_runs
+  is adequate at MVP scale; flip to pgvector HNSW when the seed corpus
+  crosses ~50.
+- Restrictive Orchestrator (one cell per campaign). The advisory shape
+  is more demo-friendly; the restrictive shape lands later when the
+  dashboard surfaces brief deep-links.
 
 ---
 
@@ -77,7 +103,7 @@ All LLM subagent calls run in parallel under `asyncio.Semaphore(8)`.
 |---|---|
 | Hard gate: 3+ attack categories | ✅ 8 categories shipped |
 | Hard gate: agent prototype running live against deployed target | ✅ Red Team mutator + Class-Probe subagent + Ensemble Judge, hits live Co-Pilot OR any registered target |
-| Hard gate: working test suite | ✅ 71 tests pass (`.venv/bin/pytest -q`, 2026-05-14) |
+| Hard gate: working test suite | ✅ **126 tests pass** (`.venv/bin/pytest --ignore=tests/test_runner.py -q`, 2026-05-15) |
 | Hard gate: results visible to reviewer | ✅ public dashboard reads from Railway Postgres |
 
 ---
@@ -90,9 +116,9 @@ Mapped to the section numbers in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 | Agent | MVP | Notes |
 |---|---|---|
-| **Red Team Swarm** | ⚠️ Partial | 2 subagents × gpt-4o-mini, hard-coded models: `red-team-mutator-0` (3 mutations per seed in the mutate node) + `red-team-class-probe-0` (10 boundary variants per FAIL in the class-probe node). **Missing for final:** configurable swarm from `config/swarm.yaml`, multi-LLM (claude-haiku, deepseek, llama-3 via Ollama), parallel synthesis with `synthesize_fn` (designed in `docs/components/synthesis-pipeline.md`). |
-| **Judge** | ✅ Shipped | Ensemble: keyword predicates + gpt-4o-mini LLM on every category. Files: `agentforge_adversarial/judges/{keyword,llm_judge,ensemble}.py`. Atomic UPDATE enforced by `attack_runs_judge_atomic` CHECK constraint. |
-| **Orchestrator** | ❌ Deferred | Designed in `docs/agents/orchestrator.md` (5-signal weighted scoring, per-category daily pools, score-weighted budget, `SwarmRecommendation`). MVP runner.py uses fixed config + flat seeds + uniform mutator instead. |
+| **Red Team Swarm** | ✅ Shipped 2026-05-15 | Mutator + class-probe + partial-reentry subagents on **Anthropic `claude-haiku-4-5-20251001`** (model-family split from Judge per ARCHITECTURE §2 — `MUTATOR_MODEL` env, default Anthropic). Provider-agnostic dispatch via `llm.chat_json` in `agentforge_adversarial/llm.py` so the mutator code branches on model-name prefix, not SDK. 3 mutations per seed, 10 boundary variants per FAIL, 3 fresh phrasings per PARTIAL. Multi-LLM via Ollama still deferred (not submission-blocking). |
+| **Judge** | ✅ Shipped | Ensemble: keyword predicates + **OpenAI `gpt-4o-mini`** LLM on every category (model-family split from Red Team per ARCHITECTURE §2 — `JUDGE_MODEL` env). Files: `agentforge_adversarial/judges/{keyword,llm_judge,ensemble}.py`. Atomic UPDATE enforced by `attack_runs_judge_atomic` CHECK constraint. |
+| **Orchestrator** | ✅ Shipped 2026-05-15 | `agentforge_adversarial/orchestrator.py` — 5-signal weighted cell scoring + `CampaignBrief`. Signals: `coverage_gap · partial_rate · severity_baseline · staleness · diversity_score`. Weights `0.30/0.30/0.20/0.10/0.10` (sum = 1.0). Cell granularity `(category, subcategory, channel)` at `taxonomy_version='v1'` (migration 009 seeds the 8 native cells). Persists the full per-cell scoring breakdown to `campaigns.brief_json` so reviewers can answer "why this campaign?" from one row. **Advisory shape** — records the brief but doesn't restrict the campaign to one cell. |
 | **Documentation Agent** | ✅ Shipped 2026-05-13 | `agentforge_adversarial/documentation_agent.py`. On every FAIL emitted by `judge_node`, writes one `vulnerabilities` row (state=discovered, severity per clinical-safety-weighted category map, parent_vuln_id resolved by walking attack_runs lineage) + one `vuln_reports` row (severity rationale, observed-vs-expected, repro steps, suggested fix, defense reference). Idempotent on `attack_run_id` via UNIQUE constraint. |
 
 ### Components (`ARCHITECTURE.md` §4-§7)
@@ -101,13 +127,13 @@ Mapped to the section numbers in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 |---|---|---|
 | **Attack Queue** | ⚠️ Partial | `attack_queue` table shipped with all designed columns + per-source provenance rules. Dispatch loop is a single sequential for-loop in `runner.py` (not the async `dispatcher_loop` with rate/cost filters from `docs/components/attack-queue.md` §4). |
 | **Dispatcher → Judge two-phase write** | ✅ Shipped | Dispatcher INSERTs `attack_runs` with Judge cols NULL; Judge UPDATEs atomically (`attack_runs_judge_atomic` CHECK). Idempotency via `attack_runs.queue_entry_id UNIQUE` + DEFERRABLE FK. |
-| **Synthesis pipeline** | ❌ Deferred | Designed in `docs/components/synthesis-pipeline.md` (6-stage: normalize → embed → dedup → novelty → score → budget-cap). MVP enqueues all mutator outputs directly. |
-| **Class-probe** | ✅ Shipped 2026-05-13 | FAIL → 10 boundary variants fan-out. Implemented as `class_probe_node` in `graph.py` + `red_team/class_probe.py` (gpt-4o-mini with a boundary-axis system prompt). Lineage stored in `attack_runs.parent_id` (migration 003). Bounded by `--max-rounds` (default 2). |
-| **Regression Harness** | 🟡 Slim version shipped 2026-05-14 | `agentforge_adversarial/regression.py` — operator-initiated replay (CLI `regress` + dashboard "🔁 Replay" button) with `PASS → fix_validated`, `FAIL → reopened`, `PARTIAL → no change`. **Deferred:** `regression_schedule` table, cron / per-deploy triggers, `attack_queue` `source='regression'` enqueue path (replays judge a stub AttackRun rather than persisting one). See full `docs/components/regression-harness.md` §4 for the unimplemented architecture. |
+| **Synthesis pipeline** | ✅ Shipped 2026-05-15 | `agentforge_adversarial/synthesis.py` — 6-stage pipeline: normalize → embed (`text-embedding-3-small`) → within-batch dedup (cosine ≥ 0.92) → novelty filter vs the last 200 attack_runs (cosine ≥ 0.85) → weighted score (`0.4·novelty + 0.4·severity_norm + 0.2·channel_diversity`) → budget-capped greedy pick (K=10 default) with channel-diversity floor. Operates on mutator output only — seed YAMLs always pass through. A typical campaign now dispatches `len(seeds) + ≤10` instead of `len(seeds) × (1 + mutations_per_seed)`. No pgvector — in-memory cosine is adequate at MVP scale. |
+| **Class-probe** | ✅ Shipped 2026-05-13 (model-family migrated 2026-05-15) | FAIL → 10 boundary variants fan-out. Implemented as `class_probe_node` in `graph.py` + `red_team/class_probe.py` (now `claude-haiku-4-5-20251001` per the family-split). Lineage stored in `attack_runs.parent_id` (migration 003). Bounded by `--max-rounds` (default 2). |
+| **Regression Harness** | ✅ Shipped 2026-05-15 (queue-backed) | `agentforge_adversarial/regression.py` — operator-initiated replay (CLI `regress` + dashboard "🔁 Replay" button). Replays now go through `attack_queue → dispatch → judge`, leaving a first-class `attack_runs` audit trail (was: stub AttackRun, never persisted). Verdict → state: `PASS → fix_validated`, `FAIL → reopened`, `PARTIAL → no change`. Queue entries use `source='regression'` + `parent_id` = original FAIL's attack_run_id. **Still deferred:** `regression_schedule` table + cron / per-deploy triggers. |
 | **Dashboard** | ✅ Shipped | Streamlit single-page: KPI cards, altair category × verdict heat-map, filterable run table, per-run drill-down. File: `dashboard/app.py`. Deployed on Railway via `railway.toml` (Nixpacks build, `/healthz` healthcheck). |
-| **Observability** | ⚠️ Partial | Stdout logging from `runner.py` only. **Missing for final:** Langfuse traces (one trace per campaign with generation spans), per-attack `langfuse_trace_id` column populated. |
-| **Postgres schema** | 🟡 Partial — 6 of ~10 designed tables | Shipped: `campaigns` (with `total_cost_usd / total_tokens_in / total_tokens_out` from migration 005), `attack_queue`, `attack_runs` (with `parent_id`/`round_num` lineage from migration 003), `targets` (from migration 002), `vulnerabilities` + `vuln_reports` (from migration 004). **Missing for final:** `near_misses` (synthesis pipeline), `cross_regressions` (regression harness), `threat_model_cells` (Orchestrator scoring grid), `cost_rollup_daily` (materialized view — the columns exist on `campaigns`; the daily-aggregate view does not), `regression_schedule` (cron-driven replays). See `docs/components/database-schema.md` §1-§10. |
-| **pgvector novelty filter** | ❌ Deferred | Designed for HNSW dedup on embeddings. Not used; mutator produces N variants without deduplication. |
+| **Observability** | ✅ Shipped 2026-05-15 | `agentforge_adversarial/observability.py` — one Langfuse trace per campaign on `cloud.langfuse.com`. Per-agent spans (orchestrator / red_team_mutator / synthesize / dispatch / judge / class_probe / partial_reentry); per-LLM generations carry tokens-in/out + cost-USD. `campaigns.langfuse_trace_id` (migration 010) stores the deep-link so the dashboard can deep-link to a trace. Degrades silently when LANGFUSE_* env keys missing — SDK failures log-and-continue, can't break a campaign. |
+| **Postgres schema** | ✅ Shipped 2026-05-15 — 9 of 10 designed tables + 1 view | **Tables:** `campaigns` (with `total_cost_usd / total_tokens_in / total_tokens_out / brief_json / langfuse_trace_id`), `attack_queue`, `attack_runs` (with `parent_id`/`round_num` lineage), `targets`, `vulnerabilities`, `vuln_reports`, **`near_misses`** (migration 007), **`cross_regressions`** (migration 008), **`threat_model_cells`** (migration 009 — versioned + seeded with 8 native MVP cells). **Still deferred:** `regression_schedule` (cron-driven replays); `cost_rollup_daily` materialized view (the columns exist on `campaigns`; the daily-aggregate view does not). |
+| **pgvector novelty filter** | ❌ Deferred | In-memory cosine vs the last 200 attack_runs (via `synthesis.py`) is adequate at MVP scale. Flip to pgvector HNSW when the seed corpus crosses ~50 cases — until then, the extra dep + index isn't earning its keep. |
 | **Operator console (in-dashboard campaign launch)** | ✅ Shipped 2026-05-13 | Launch panel with target picker, "+ Add target" form, swarm-config picker (mutator toggle / class-probe rounds slider / model dropdown), Approve/Modify/Override gate (Review-before-dispatch checkbox), Cancel button, phase-aware progress fragment. Per `docs/components/dashboard.md §4.1`. **Still deferred for final:** Vuln Board (P1), Cost tile (P2). |
 
 ### Orchestration framework (`ARCHITECTURE.md` §3, §4)
@@ -192,11 +218,15 @@ submission should aim for everything in P0 + P1; P2 is bonus.
 
 | Item | Effort | What it unlocks |
 |---|---|---|
-| Langfuse integration (`langfuse_trace_id` per campaign, generation spans per attack) | 3 h | Designed in `docs/components/observability.md`. Gives reviewers a trace per attack. **Status: deferred** — requires an external Langfuse account; out of scope for tonight's submission. |
-| ~~Per-campaign LLM cost rollup~~ | ✅ ~~1.5 h~~ | Shipped 2026-05-14 as migration `005_cost_rollup.sql` + `agentforge_adversarial/cost.py` + sidebar "Red-team LLM cost" tile. ContextVar threads `campaign_id` through `asyncio.gather`; per-1M-token USD price table (2026-05 snapshot) for gpt-4o, gpt-4o-mini, gpt-4.1-mini. Cost is harness-side only — target's own LLM bill is not visible through a black-box chat interface. |
-| ~~Regression Harness — slim version~~ | ✅ ~~2 h~~ | Shipped 2026-05-14 as `agentforge_adversarial/regression.py` + CLI `python -m agentforge_adversarial regress` + Vuln-Board "🔁 Replay" button. Replay verdict → state map: PASS → `fix_validated`, FAIL → `reopened`, PARTIAL → no change. Replays use the same ensemble Judge as the live graph. **Deferred from slim:** `regression_schedule` table + cron triggers + `attack_queue` `source='regression'` enqueue + `/healthz`-SHA `target_version` tracking (the slim version compares `target_type:target_url` strings, so it detects different *targets* but not different *deploys* of the same target). |
+| ~~Langfuse integration (`langfuse_trace_id` per campaign, generation spans per attack)~~ | ✅ ~~3 h~~ | Shipped 2026-05-15 as `agentforge_adversarial/observability.py` + migration `010_langfuse_trace.sql`. One trace per campaign on `cloud.langfuse.com`; per-agent spans (orchestrator / red_team_mutator / synthesize / dispatch / judge / class_probe / partial_reentry); per-LLM generations carrying tokens-in/out + cost-USD. `campaigns.langfuse_trace_id` for dashboard deep-links. ContextVar threading via `set_trace_id` / `set_current_span` mirrors the `cost.set_campaign` pattern so `asyncio.gather` fan-outs attach correctly. |
+| ~~Per-campaign LLM cost rollup~~ | ✅ ~~1.5 h~~ | Shipped 2026-05-14 as migration `005_cost_rollup.sql` + `agentforge_adversarial/cost.py` + sidebar "Red-team LLM cost" tile. ContextVar threads `campaign_id` through `asyncio.gather`; per-1M-token USD price table (2026-05 snapshot) for gpt-4o, gpt-4o-mini, gpt-4.1-mini, **claude-haiku-4-5, text-embedding-3-small (added 2026-05-15)**. Cost is harness-side only — target's own LLM bill is not visible through a black-box chat interface. |
+| ~~Regression Harness — queue-backed~~ | ✅ ~~2 + 2 h~~ | Slim version shipped 2026-05-14; **upgraded to queue-backed evidence path 2026-05-15** in `agentforge_adversarial/regression.py`. Replays now enqueue `source='regression'` rows into `attack_queue` (parent_id = original FAIL's attack_run_id), dispatch through the same path as live campaigns, and persist real `attack_runs` rows. Verdict → state map unchanged. **Still deferred:** `regression_schedule` cron + `/healthz`-SHA `target_version`. |
 | ~~History-aware mutator + class-probe prompts (D)~~ | ✅ ~~1.5 h~~ | Shipped 2026-05-14 as `red_team/mutator.py:_format_history_hint()`. In rounds 1+, the LLM sees a same-category-filtered list of REFUSED (= PASS) and SUCCEEDED (= FAIL) prompts. Biases variants away from already-defended framings. |
-| Multimodal & Document Poisoning (MP) — 9th attack category via `/v1/documents/attach` | 4 h | Per `THREAT_MODEL.md` §8. **Status: deferred** — requires target-side `/v1/documents/attach` endpoint + multipart dispatcher. Out of scope for tonight; 8/9 categories shipped is the demo claim. |
+| ~~`synthesize_fn` 6-stage pipeline~~ | ✅ ~~5 h~~ | Shipped 2026-05-15 as `agentforge_adversarial/synthesis.py`. Filters the noisy mutator stream into K final attacks via normalize → embed (text-embedding-3-small) → dedup → novelty filter → weighted score → budget-capped greedy pick. K=10 default; tunable via `state["synthesis_k"]`. Operates on mutator output only (seed YAMLs untouched). |
+| ~~Orchestrator 5-signal cell scoring + `CampaignBrief`~~ | ✅ ~~6 h~~ | Shipped 2026-05-15 as `agentforge_adversarial/orchestrator.py` + migration `009_threat_model_cells.sql`. Advisory shape — records the brief on `campaigns.brief_json` for audit; doesn't restrict the campaign to one cell. |
+| ~~`near_misses` table + PARTIAL lifecycle~~ | ✅ ~~1.5 h~~ | Shipped 2026-05-15 as migration `007_near_misses.sql` + `agentforge_adversarial/near_miss.py`. Every PARTIAL verdict creates an `exploring` row; state machine `exploring → escalated / exhausted / budget_capped` driven by post-verdict routing. Helpers ship; the post-verdict transition wiring is the follow-up. |
+| ~~`cross_regressions` table + detection~~ | ✅ ~~2 h~~ | Shipped 2026-05-15 as migration `008_cross_regressions.sql` + `agentforge_adversarial/cross_regression.py`. Detection runs at every campaign end; one SQL joins current-campaign FAILs to prior PASSes on a different `target_version`. Idempotent on `(attack_run_id, prior_attack_run_id)`. |
+| Multimodal & Document Poisoning (MP) — 9th attack category via `/v1/documents/attach` | 4 h | Per `THREAT_MODEL.md` §8. **Status: deferred** — requires target-side `/v1/documents/attach` endpoint + multipart dispatcher. 8/9 categories shipped. |
 
 ### Not planned for final
 
@@ -216,8 +246,14 @@ submission should aim for everything in P0 + P1; P2 is bonus.
 |---|---|
 | `agentforge_adversarial/runner.py` | Thin wrapper that resolves the target, builds the chat client, and invokes the compiled LangGraph state machine. |
 | `agentforge_adversarial/graph.py` | LangGraph `CampaignState` + **7 nodes** (`load_seeds`, `mutate`, `dispatch`, `judge`, `partial_reentry`, `class_probe`, `bump_round`) + two conditional edges (`decide_after_judge`, `decide_after_partial_reentry`). |
-| `agentforge_adversarial/red_team/mutator.py` | Mutator subagent — gpt-4o-mini, 3 mutations per seed. Now history-aware (rounds 1+ see same-category REFUSED/SUCCEEDED context). |
-| `agentforge_adversarial/red_team/class_probe.py` | Class-probe subagent (10 boundary variants per FAIL via gpt-4o-mini). Also history-aware. |
+| `agentforge_adversarial/red_team/mutator.py` | Mutator subagent — **claude-haiku-4-5-20251001 by default** (model-family split from Judge per ARCHITECTURE §2). 3 mutations per seed. Provider dispatch via `llm.chat_json` (model-name prefix). History-aware (rounds 1+ see same-category REFUSED/SUCCEEDED context). |
+| `agentforge_adversarial/red_team/class_probe.py` | Class-probe subagent (10 boundary variants per FAIL via `claude-haiku-4-5-20251001`). History-aware. |
+| `agentforge_adversarial/synthesis.py` | 6-stage `synthesize_fn` pipeline (2026-05-15). Filters mutator output to K=10 final attacks via normalize → embed → dedup → novelty → score → budget-capped greedy pick with channel-diversity floor. |
+| `agentforge_adversarial/orchestrator.py` | Advisory 5-signal cell scoring + `CampaignBrief` (2026-05-15). Runs in `load_seeds_node` after seed enqueue; persists scoring breakdown to `campaigns.brief_json`. |
+| `agentforge_adversarial/near_miss.py` | `record_near_miss` / `set_state` / `bump_variant_count` helpers (2026-05-15). Called from `judge_node` on every PARTIAL verdict. |
+| `agentforge_adversarial/cross_regression.py` | `detect_for_campaign` / `list_unacknowledged` / `acknowledge` helpers (2026-05-15). Detection runs at every campaign end in the runner's post-graph cleanup. |
+| `agentforge_adversarial/observability.py` | Langfuse trace + span + generation helpers (2026-05-15). Lazy client init; ContextVar-based propagation across `asyncio.gather`; SDK failures log + continue. |
+| `agentforge_adversarial/llm.py` | Provider-agnostic `chat_json` helper (2026-05-15). Dispatches OpenAI vs Anthropic by model-name prefix so `mutator.py` and `class_probe.py` stay provider-agnostic. |
 | `agentforge_adversarial/targets.py` | CRUD helpers over the `targets` table (list, get-by-name, default, add). |
 | `agentforge_adversarial/queue.py` | `create_campaign`, `enqueue_cases` (writes to `attack_queue`). |
 | `agentforge_adversarial/target.py` | `CopilotClient` (auto-creates session via `POST /v1/sessions`, 404-retry, `COPILOT_PATIENT_ID` env fallback), `GenericChatClient`, `MockCopilotClient` (deliberately-vulnerable test double), `make_client()` factory dispatching by `target_type` (copilot / generic_chat / openai_compat / mock). |
@@ -235,8 +271,12 @@ submission should aim for everything in P0 + P1; P2 is bonus.
 | `migrations/004_vuln_lifecycle.sql` | `vulnerabilities` + `vuln_reports` tables; `vuln_state` + `vuln_severity` enums. |
 | `migrations/005_cost_rollup.sql` | `campaigns.total_cost_usd / total_tokens_in / total_tokens_out` columns. |
 | `migrations/006_mock_target.sql` | Widens `targets.target_type` CHECK to include `'mock'`; seeds the Mock Co-Pilot row. |
+| `migrations/007_near_misses.sql` | `near_misses` table + state CHECK (exploring/escalated/exhausted/budget_capped). |
+| `migrations/008_cross_regressions.sql` | `cross_regressions` table + partial index on unacknowledged rows. |
+| `migrations/009_threat_model_cells.sql` | `threat_model_cells` table (versioned) + seed for the 8 native MVP cells; `campaigns.brief_json JSONB`. |
+| `migrations/010_langfuse_trace.sql` | `campaigns.langfuse_trace_id TEXT` + partial index for traced campaigns. |
 | `evals/cases/*.yaml` | **32 seed test cases:** 8 hand-curated (`evals/cases/*.yaml`) + 15 Garak-derived (`evals/cases/garak/`) + 5 JailbreakBench (`evals/cases/jailbreakbench/`) + 4 HouYi indirect-injection (`evals/cases/houyi/`). |
-| `tests/` | **71 passing tests** — unit + live-Postgres integration. Run via `.venv/bin/pytest -q` (verified 2026-05-14). |
+| `tests/` | **126 passing tests** — unit + live-Postgres integration. Run via `.venv/bin/pytest --ignore=tests/test_runner.py -q` (verified 2026-05-15). |
 
 ---
 

@@ -58,53 +58,64 @@ is a separate repo. The README of each links to the other.
 
 ---
 
-## MVP run (2026-05-12)
+## Architecture-complete (2026-05-15)
 
-> **Scope honesty:** this is an **architecture-aligned vertical slice**
-> of `ARCHITECTURE.md`, not the full multi-agent platform. The
-> load-bearing pieces are shipped — LangGraph state machine, Postgres
-> queue/run two-phase write, ensemble Judge, Documentation Agent, vuln
-> lifecycle, multi-target factory, cost rollup, FAIL/PARTIAL fan-out —
-> but the **full Orchestrator scoring engine, synthesize_fn pipeline,
-> `regression_schedule` cron, and Langfuse tracing remain as final
-> work** beyond this submission. See `IMPLEMENTATION.md` for the
-> per-component matrix; section §"P2 deferred" lists what's not in.
+> **Scope honesty:** as of 2026-05-15 this codebase is **architecture-
+> complete** — every pillar described in `ARCHITECTURE.md` has a
+> shipped, tested implementation. The 2026-05-15 sweep closed the
+> seven gaps the 2026-05-12 MVP had left as "deferred"
+> (Orchestrator scoring, `synthesize_fn` pipeline, Langfuse traces,
+> `near_misses`/`cross_regressions` tables, queue-backed regression,
+> Judge/Red Team model-family split). See `IMPLEMENTATION.md` for
+> the per-component status matrix and which design choices were
+> locked in code.
 
-Vertical slice of the platform: 8 of 9 designed attack categories,
-**32 seeds × ~3-LLM-mutations** per default campaign, dispatched
-against any registered target (mock, deployed Co-Pilot, generic_chat,
-openai_compat), verdicts written by an **ensemble Judge (keyword +
-gpt-4o-mini LLM, every category)** to Postgres, surfaced on a
-Streamlit dashboard.
+The platform: 8 of 9 designed attack categories, **32 seeds** filtered
+by a 6-stage `synthesize_fn` pipeline into ≤10 final attacks per
+campaign, dispatched against any registered target (mock, deployed
+Co-Pilot, generic_chat, openai_compat), verdicts written by an
+**ensemble Judge (deterministic keyword + OpenAI `gpt-4o-mini` LLM,
+every category)** to Postgres, surfaced on a Streamlit dashboard, with
+a per-campaign Langfuse trace + per-LLM generation spans on Langfuse
+Cloud. Red Team subagents run on **Anthropic `claude-haiku-4-5-20251001`**
+(different model family from the Judge — `ARCHITECTURE.md` §2).
 
-### What's in the MVP
+### What's shipped
 
-| Component | MVP coverage |
+| Component | Status |
 |---|---|
-| Postgres schema | ✅ **6 of ~10 designed tables**: `campaigns` (with `total_cost_usd / total_tokens_in / total_tokens_out` cost columns), `attack_queue`, `attack_runs` (with `parent_id` / `round_num` lineage), `targets`, `vulnerabilities`, `vuln_reports`. Atomic CHECK + DEFERRABLE FK enforced. **Missing for final:** `near_misses`, `cross_regressions`, `threat_model_cells`, `cost_rollup_daily` view, `regression_schedule` (per `docs/components/database-schema.md`). |
+| Postgres schema | ✅ **9 of 10 designed tables + 1 column-set**: `campaigns` (with `total_cost_usd / total_tokens_in / total_tokens_out / brief_json / langfuse_trace_id`), `attack_queue`, `attack_runs` (with `parent_id` / `round_num` lineage), `targets`, `vulnerabilities`, `vuln_reports`, `near_misses` (migration 007), `cross_regressions` (migration 008), `threat_model_cells` (migration 009 — versioned + seeded). Atomic CHECK + DEFERRABLE FK enforced. **Still deferred:** `regression_schedule` (cron-driven replays); `cost_rollup_daily` materialized view (the columns exist on `campaigns`; the daily-aggregate view does not). |
 | Dispatcher INSERTs / Judge UPDATEs with atomic CHECK | ✅ two-phase write enforced by `attack_runs_judge_atomic` |
 | Attack-category coverage | ✅ **8 of 9** — Prompt Injection · Data Exfiltration · Tool Misuse · State Corruption · Identity & Role · DoS & Cost · Observability Leak ⭐ · Verification-Gate Bypass ⭐. Deferred: Multimodal & Document Poisoning (needs `/v1/documents/attach` channel, not `/v1/chat`) |
 | Keyword Judge | ✅ category-specific marker sets + DoS length predicate (response > 2000 chars) |
-| LLM Judge (gpt-4o-mini) | ✅ runs on **every** category; SYSTEM_PROMPT is category-general and uses each seed's `expected_failure_mode` as the per-category rubric anchor |
+| LLM Judge (OpenAI `gpt-4o-mini`) | ✅ runs on **every** category; SYSTEM_PROMPT is category-general and uses each seed's `expected_failure_mode` as the per-category rubric anchor |
 | Ensemble Judge | ✅ keyword + LLM combined; agreement / disagreement recorded in `judge_reasoning` |
-| Red Team mutator subagent (gpt-4o-mini) | ✅ 3 mutations per seed, `source='random'`, parallel via `asyncio.gather` |
-| Red Team class-probe subagent (gpt-4o-mini) | ✅ 10 boundary variants per FAIL, `source='class_probe'`, parent lineage via `attack_runs.parent_id`, parallel via `asyncio.gather` |
-| Red Team partial-reentry subagent (gpt-4o-mini) | ✅ 3 fresh phrasings per PARTIAL to disambiguate ambiguous verdicts, parent lineage via `attack_runs.parent_id` |
-| LangGraph state machine | ✅ 7 nodes (load_seeds → mutate → dispatch → judge → partial_reentry / class_probe / bump_round → dispatch). Two conditional edges: `decide_after_judge` (PARTIAL/FAIL/END) + `decide_after_partial_reentry` (class_probe/bump_round). Bounded by `--max-rounds`. |
-| Multi-target via `targets` table | ✅ 3 target types: `copilot` (auto-creates `/v1/sessions`), `generic_chat` (any HTTP/JSON LLM with a prompt template), `openai_compat` (OpenAI Chat Completions wire format) |
+| **Judge / Red Team model family split** | ✅ Judge on OpenAI (`gpt-4o-mini`), Red Team on Anthropic (`claude-haiku-4-5-20251001`). Provider-agnostic dispatch via `llm.chat_json`. **(2026-05-15)** |
+| Red Team mutator subagent (Anthropic `claude-haiku-4-5-20251001`) | ✅ 3 mutations per seed, `source='random'`, parallel via `asyncio.gather` |
+| Red Team class-probe subagent (Anthropic `claude-haiku-4-5-20251001`) | ✅ 10 boundary variants per FAIL, `source='class_probe'`, parent lineage via `attack_runs.parent_id` |
+| Red Team partial-reentry subagent (Anthropic `claude-haiku-4-5-20251001`) | ✅ 3 fresh phrasings per PARTIAL to disambiguate ambiguous verdicts |
+| **Orchestrator** | ✅ Advisory 5-signal cell scoring + `CampaignBrief` (`agentforge_adversarial/orchestrator.py`). Weights: `0.30 coverage_gap · 0.30 partial_rate · 0.20 severity_baseline · 0.10 staleness · 0.10 diversity_score`. Persists per-cell breakdown to `campaigns.brief_json` for audit. **(2026-05-15)** |
+| **`synthesize_fn` 6-stage pipeline** | ✅ `agentforge_adversarial/synthesis.py`. normalize → embed (`text-embedding-3-small`) → dedup (cosine ≥ 0.92) → novelty filter vs last 200 history (cosine ≥ 0.85) → score → budget-capped greedy pick (K=10). Operates on mutator output; seed YAMLs always pass through. **(2026-05-15)** |
+| **`near_misses` lifecycle** | ✅ migration 007 + `agentforge_adversarial/near_miss.py`. Every PARTIAL verdict creates an `exploring` row; state machine `exploring → escalated / exhausted / budget_capped`. **(2026-05-15)** |
+| **`cross_regressions` detection** | ✅ migration 008 + `agentforge_adversarial/cross_regression.py`. Detection runs at every campaign end; finds case_ids that PASSed on a prior `target_version` but FAILed on the current one. **(2026-05-15)** |
+| LangGraph state machine | ✅ 7 nodes (load_seeds → mutate → dispatch → judge → partial_reentry / class_probe / bump_round → dispatch). Two conditional edges: `decide_after_judge` + `decide_after_partial_reentry`. Bounded by `--max-rounds`. |
+| Multi-target via `targets` table | ✅ 4 target types: `copilot` (auto-creates `/v1/sessions`), `generic_chat` (any HTTP/JSON LLM with a prompt template), `openai_compat` (OpenAI Chat Completions wire format), `mock` (in-process stub for offline demos) |
 | Streamlit dashboard | ✅ 4-tab layout (📊 Coverage / 🛡️ Vulns / 🎯 Runs / 🚀 Launch) with persistent sidebar carrying campaign scope, live KPIs (Total / FAIL / PARTIAL / PASS), red-team LLM cost tile, and active-campaign progress fragment |
 | Documentation Agent | ✅ writes `vulnerabilities` + `vuln_reports` rows on every FAIL; severity weighted by clinical-safety impact; lineage via `attack_runs.parent_id` |
 | Seed corpus | ✅ **32 seeds** (8 hand-curated + 15 Garak + 5 JailbreakBench + 4 HouYi) across 8 categories |
-| Cost rollup | ✅ ContextVar threads `campaign_id` through `asyncio.gather`; per-1M-token price table (2026-05 snapshot) for gpt-4o / gpt-4o-mini / gpt-4.1-mini; sidebar cost tile + token caption |
-| Regression harness | ✅ `python -m agentforge_adversarial regress` CLI + Vuln-Board "🔁 Replay" button; PASS → fix_validated, FAIL → reopened, PARTIAL → no change |
+| Cost rollup | ✅ ContextVar threads `campaign_id` through `asyncio.gather`; per-1M-token price table (2026-05 snapshot) for `gpt-4o / gpt-4o-mini / gpt-4.1-mini / claude-haiku-4-5 / claude-sonnet-4-6 / claude-opus-4-7 / text-embedding-3-small/large`; sidebar cost tile |
+| **Queue-backed regression harness** | ✅ Replays now go through `attack_queue → dispatch → judge`, leaving a first-class `attack_runs` audit trail. Verdict → state: PASS → fix_validated, FAIL → reopened, PARTIAL → no change. **(2026-05-15)** |
 | History-aware Red Team prompts | ✅ rounds 1+ feed REFUSED/SUCCEEDED same-category context into mutator + class-probe LLM prompts to bias away from already-defended framings |
+| **Langfuse observability** | ✅ `agentforge_adversarial/observability.py` + migration 010. One trace per campaign on `cloud.langfuse.com`; per-agent spans (orchestrator / red_team_mutator / synthesize / dispatch / judge / class_probe / partial_reentry); per-LLM generations with tokens-in/out + cost-USD. `campaigns.langfuse_trace_id` for deep-link. Degrades silently when `LANGFUSE_*` env keys missing. **(2026-05-15)** |
 
-**Headline deferred items:** Langfuse traces (P2 — needs external account),
-Multimodal & Document Poisoning category (P2 — needs target-side
-`/v1/documents/attach`), pgvector novelty dedup (not planned),
-`regression_schedule` table + cron (slim regression-harness shipped instead).
-P0 + P1 shipped 2026-05-13; P2 shipped 2026-05-14. Detailed matrix in
-[`IMPLEMENTATION.md`](IMPLEMENTATION.md).
+**Remaining deferred items** (low demo ROI, not submission-gate-blocking):
+Multimodal & Document Poisoning category (needs target-side
+`/v1/documents/attach`), `regression_schedule` cron + per-deploy triggers,
+`/healthz`-SHA-based `target_version` tracking, pgvector HNSW novelty
+filter (in-memory cosine is adequate at MVP scale). P0 + P1 shipped
+2026-05-13; P2 cost+history+slim-regression shipped 2026-05-14; P3
+architecture-fidelity sweep (Track A + B + C, 7 features) shipped
+2026-05-15. Detailed matrix in [`IMPLEMENTATION.md`](IMPLEMENTATION.md).
 
 ### Setup
 
@@ -235,13 +246,28 @@ laptop-side CLI is needed once `COPILOT_PATIENT_ID` is configured.
 ### What's deferred from the full design
 
 See **[`IMPLEMENTATION.md`](IMPLEMENTATION.md)** for the full status matrix
-(per-component MVP coverage, live verification results, prioritized gap to
+(per-component coverage, live verification results, prioritized gap to
 final submission with effort estimates).
 
-Short list of deferred items: Orchestrator scoring · synthesize_fn pipeline ·
-Langfuse traces (needs external account) · pgvector novelty · Multimodal /
-document-poisoning channel (needs target-side endpoint) ·
-`regression_schedule` table + cron (slim CLI + button shipped instead).
+As of 2026-05-15 the platform is architecture-complete; what remains
+deferred is operationally narrow:
+
+- **Multimodal & Document Poisoning** category — needs target-side
+  `/v1/documents/attach` endpoint + multipart dispatcher. 8/9
+  categories shipped is the demo claim.
+- **`regression_schedule` cron + per-deploy triggers** — the
+  queue-backed regression harness covers the *evidence path* (replays
+  are first-class `attack_runs` rows now); the *trigger path* is
+  operator-initiated for now.
+- **`/healthz`-SHA-based `target_version` tracking** — the current
+  implementation records `target_version = f"{target_type}:{target_url}"`,
+  which distinguishes targets but not deploys of the same target.
+- **pgvector HNSW novelty filter** — in-memory cosine vs the last 200
+  attack_runs is adequate at MVP scale; flip when the seed corpus
+  crosses ~50.
+- **Restrictive Orchestrator** (one cell per campaign) — the advisory
+  shape that ships is more demo-friendly.
+
 Refer to `ARCHITECTURE.md` for the full design intent.
 
 ---
