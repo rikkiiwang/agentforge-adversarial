@@ -6,6 +6,7 @@ import pytest
 from agentforge_adversarial.target import (
     CopilotClient,
     GenericChatClient,
+    auto_pick_patient_id,
     make_client,
 )
 
@@ -113,6 +114,86 @@ async def test_generic_chat_client_substitutes_and_extracts():
     out = await client.chat("hello world")
     assert out == "the answer"
     assert captured[0]["messages"][0]["content"] == "hello world"
+
+
+async def test_auto_pick_returns_first_uuid():
+    """Happy path: /v1/patients returns one UUID; helper extracts the id."""
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            200,
+            json={"patients": [{"id": "uuid-1"}, {"id": "uuid-2"}], "count": 2},
+        )
+
+    picked = await auto_pick_patient_id(
+        "https://copilot.example.invalid/",
+        transport=httpx.MockTransport(handler),
+    )
+    assert picked == "uuid-1"
+    # Trailing slash stripped, limit=1 always requested.
+    assert str(captured[0].url) == (
+        "https://copilot.example.invalid/v1/patients?limit=1"
+    )
+
+
+async def test_auto_pick_returns_none_when_endpoint_missing():
+    """A Co-Pilot deploy that predates the /v1/patients endpoint returns 404.
+    Helper must return None so the caller falls back to its existing error."""
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"detail": "Not Found"})
+
+    picked = await auto_pick_patient_id(
+        "https://copilot.example.invalid",
+        transport=httpx.MockTransport(handler),
+    )
+    assert picked is None
+
+
+async def test_auto_pick_returns_none_when_list_empty():
+    """200 OK with empty list (e.g. physician panel filters everything out)
+    → None, not a crash."""
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"patients": [], "count": 0})
+
+    picked = await auto_pick_patient_id(
+        "https://copilot.example.invalid",
+        transport=httpx.MockTransport(handler),
+    )
+    assert picked is None
+
+
+async def test_auto_pick_returns_none_on_network_error():
+    """Network failure (DNS, timeout, TLS) must not raise — we want the
+    campaign launch to continue to make_client and surface its existing
+    'CopilotClient needs patient_id' error message instead."""
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("simulated DNS failure")
+
+    picked = await auto_pick_patient_id(
+        "https://copilot.example.invalid",
+        transport=httpx.MockTransport(handler),
+    )
+    assert picked is None
+
+
+async def test_auto_pick_forwards_physician_user_id():
+    """When the caller passes a physician_user_id, it must reach the endpoint
+    as a query param so the server-side panel filter applies correctly."""
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"patients": [{"id": "uuid-x"}], "count": 1})
+
+    picked = await auto_pick_patient_id(
+        "https://copilot.example.invalid",
+        physician_user_id="dr_alvarez",
+        transport=httpx.MockTransport(handler),
+    )
+    assert picked == "uuid-x"
+    assert "physician_user_id=dr_alvarez" in str(captured[0].url)
 
 
 async def test_generic_chat_client_falls_back_on_missing_path():

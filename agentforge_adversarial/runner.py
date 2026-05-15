@@ -19,10 +19,11 @@ from agentforge_adversarial.config import Config
 from agentforge_adversarial.db import close_pool, connection
 from agentforge_adversarial import cost
 from agentforge_adversarial.graph import MAX_ROUNDS_DEFAULT, build_graph
-from agentforge_adversarial.target import ChatClient, make_client
+from agentforge_adversarial.target import ChatClient, auto_pick_patient_id, make_client
 from agentforge_adversarial.targets import (
     get_default_target,
     get_target_by_name,
+    patch_target_config,
 )
 
 
@@ -54,6 +55,25 @@ async def run_campaign(
                 "form or run `make init-db` to seed the default Co-Pilot target."
             )
         target_row = row
+        # Auto-pick patient_id on first launch for Co-Pilot targets that haven't
+        # been configured yet. Removes the manual UUID copy step from the
+        # README's "Run a campaign — deployed Co-Pilot target" recipe. Best-effort
+        # — if the endpoint is missing/empty/unreachable, make_client below will
+        # raise the existing RuntimeError pointing at the env-var fallback.
+        if (
+            target_row["target_type"] == "copilot"
+            and not (target_row.get("config_json") or {}).get("patient_id")
+        ):
+            picked = await auto_pick_patient_id(target_row["target_url"])
+            if picked:
+                async with connection(cfg) as conn:
+                    await patch_target_config(
+                        conn, target_row["id"], {"patient_id": picked}
+                    )
+                cfg_json = dict(target_row.get("config_json") or {})
+                cfg_json["patient_id"] = picked
+                target_row["config_json"] = cfg_json
+                print(f"[target] auto-picked patient_id={picked[:12]}…")
         chat_client = make_client(target_row)
         target_label = f"{target_row['name']} ({target_row['target_url']})"
         target_version = f"{target_row['target_type']}:{target_row['target_url']}"
